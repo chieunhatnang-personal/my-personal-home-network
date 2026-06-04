@@ -10,6 +10,8 @@ OVPNMAN="/usr/local/bin/ovpnman"
 CLIENT_OUTDIR="/root/ovpn-clients"
 LOG_FILE="/var/log/openvpn-server.log"
 STATUS_FILE="/var/log/openvpn-status.log"
+LOGROTATE_CONF="/etc/logrotate.d/openvpn-server"
+TERMINAL_STATE=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -23,8 +25,20 @@ cmd_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+restore_terminal() {
+  [ -n "$TERMINAL_STATE" ] || return 0
+  stty "$TERMINAL_STATE" 2>/dev/null || true
+  TERMINAL_STATE=""
+}
+
 setup_terminal() {
   [ -t 0 ] || return 0
+  TERMINAL_STATE="$(stty -g 2>/dev/null || true)"
+  [ -n "$TERMINAL_STATE" ] || return 0
+  trap 'restore_terminal' 0
+  trap 'restore_terminal; exit 130' INT
+  trap 'restore_terminal; exit 143' TERM
+  trap 'restore_terminal; exit 129' HUP
   # This TV box/terminal commonly sends ^H for Backspace. Do not force ^?
   # here; that makes Backspace appear literally as ^H^H^H in prompts.
   # echoe makes the terminal visibly erase the old character instead of only
@@ -233,6 +247,12 @@ valid_port() {
 
 valid_proto() {
   case "$1" in udp|tcp) return 0 ;; *) return 1 ;; esac
+}
+
+valid_dh_params() {
+  file="$1"
+  [ -s "$file" ] || return 1
+  openssl dhparam -in "$file" -check -noout >/dev/null 2>&1
 }
 
 normalize_ipv4_cidr() {
@@ -478,11 +498,16 @@ prepare_easyrsa() {
     info "Server certificate already exists."
   fi
 
-  if [ ! -f pki/dh.pem ]; then
+  if valid_dh_params pki/dh.pem; then
+    info "DH parameters already exist and are valid."
+  else
+    if [ -e pki/dh.pem ]; then
+      warn "Existing DH parameters are empty or invalid; regenerating them."
+      rm -f pki/dh.pem
+    fi
     info "Generating DH parameters. This can be slow on S805."
     ./easyrsa gen-dh
-  else
-    info "DH parameters already exist."
+    valid_dh_params pki/dh.pem || die "Generated DH parameters failed OpenSSL validation."
   fi
 
   if [ ! -f ta.key ]; then
@@ -496,7 +521,9 @@ prepare_easyrsa() {
   cp pki/ca.crt /etc/openvpn/ca.crt
   cp pki/issued/server.crt /etc/openvpn/server.crt
   cp pki/private/server.key /etc/openvpn/server.key
+  valid_dh_params pki/dh.pem || die "Refusing to install empty or invalid DH parameters."
   cp pki/dh.pem /etc/openvpn/dh.pem
+  valid_dh_params /etc/openvpn/dh.pem || die "Installed DH parameters failed OpenSSL validation."
   cp ta.key /etc/openvpn/ta.key
 
   if [ -f pki/crl.pem ]; then
@@ -617,7 +644,7 @@ write_server_conf() {
   if ask_yn "Route all client internet traffic through this box?" "n"; then REDIRECT_GATEWAY="yes"; else REDIRECT_GATEWAY="no"; fi
   DNS1="$(ask "DNS server pushed to clients" "1.1.1.1")"; echo
   DNS2="$(ask "Second DNS server pushed to clients, or empty" "8.8.8.8")"; echo
-  VERB="$(ask "OpenVPN verbosity" "6")"; echo
+  VERB="$(ask "OpenVPN verbosity" "3")"; echo
 
   {
     echo "port $PORT"
@@ -664,6 +691,21 @@ write_server_conf() {
 
   chmod 600 /etc/openvpn/server.key
   chmod 644 "$SERVER_CONF"
+}
+
+configure_log_rotation() {
+  info "Configuring OpenVPN log rotation."
+  cat > "$LOGROTATE_CONF" <<EOF
+$LOG_FILE {
+    size 10M
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+  chmod 644 "$LOGROTATE_CONF"
 }
 
 ensure_forwarding_and_nat() {
@@ -966,24 +1008,30 @@ OVPNMAN_EOF
 
 restart_service() {
   info "Starting/restarting OpenVPN."
+  restarted="no"
   if service openvpn restart; then
-    :
+    restarted="yes"
   elif cmd_exists systemctl && systemctl restart openvpn@server; then
-    :
-  else
-    warn "Service restart failed. Trying a short daemonized config test."
-    rm -f /tmp/openvpn-installer-test.pid /tmp/openvpn-installer-test.log
-    if openvpn --config "$SERVER_CONF" --daemon openvpn-installer-test --writepid /tmp/openvpn-installer-test.pid --log /tmp/openvpn-installer-test.log; then
-      sleep 3
-      if [ -f /tmp/openvpn-installer-test.pid ]; then
-        kill "$(cat /tmp/openvpn-installer-test.pid)" >/dev/null 2>&1 || true
-      fi
-      warn "OpenVPN can start manually, but the init service failed. Check /etc/init.d/openvpn on this box."
-    else
-      warn "Manual OpenVPN start failed too. Last test log:"
-      tail -n 60 /tmp/openvpn-installer-test.log 2>/dev/null || true
-    fi
+    restarted="yes"
   fi
+
+  [ "$restarted" = "yes" ] || die "OpenVPN service restart command failed."
+
+  # The Debian SysV init script may return success before OpenVPN finishes
+  # loading its configuration, so verify the daemon after startup settles.
+  sleep 3
+  if service openvpn status >/dev/null 2>&1; then
+    info "OpenVPN is running."
+    return 0
+  fi
+  if cmd_exists systemctl && systemctl is-active --quiet openvpn@server; then
+    info "OpenVPN is running."
+    return 0
+  fi
+
+  warn "OpenVPN stopped after the restart command reported success. Last log lines:"
+  tail -n 60 "$LOG_FILE" 2>/dev/null || true
+  die "OpenVPN failed to stay running."
 }
 
 show_status() {
@@ -1008,6 +1056,7 @@ main() {
   ensure_tun
   prepare_easyrsa
   write_server_conf
+  configure_log_rotation
   ensure_forwarding_and_nat
   install_ovpnman
   restart_service
