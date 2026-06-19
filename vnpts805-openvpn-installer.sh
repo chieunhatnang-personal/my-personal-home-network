@@ -39,11 +39,9 @@ setup_terminal() {
   trap 'restore_terminal; exit 130' INT
   trap 'restore_terminal; exit 143' TERM
   trap 'restore_terminal; exit 129' HUP
-  # This TV box/terminal commonly sends ^H for Backspace. Do not force ^?
-  # here; that makes Backspace appear literally as ^H^H^H in prompts.
-  # echoe makes the terminal visibly erase the old character instead of only
-  # moving the cursor left and leaving stale text on screen.
-  stty erase '^H' echoe echok -echoprt 2>/dev/null || true
+  # Preserve the terminal's existing erase character: some clients send ^H,
+  # while others send ^?. Changing it makes the other form appear literally.
+  stty echoe echok -echoprt 2>/dev/null || true
 }
 
 clean_answer() {
@@ -660,6 +658,7 @@ write_server_conf() {
     echo "# OpenVPN server tunnel IP: $VPN_SERVER_IP"
     echo "server $VPN_NET $VPN_MASK"
     echo "topology $TOPOLOGY"
+    echo "client-config-dir /etc/openvpn/ccd"
     echo
     printf "%s" "$PUSH_ROUTES" | while read route_net route_prefix; do
       [ -n "$route_net" ] || continue
@@ -778,6 +777,7 @@ NAME="${2:-}"
 EASYRSA_DIR="/etc/openvpn/easy-rsa"
 OUTDIR="/root/ovpn-clients"
 SERVER_CONF="/etc/openvpn/server.conf"
+CCD_DIR="/etc/openvpn/ccd"
 
 REMOTE_HOST="__REMOTE_HOST__"
 REMOTE_PORT="__REMOTE_PORT__"
@@ -786,7 +786,33 @@ DEFAULT_CIPHER="__CIPHER__"
 DEFAULT_AUTH="__AUTH__"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-need_name() { [ -n "$NAME" ] || die "Usage: ovpnman $ACTION <client-name>"; }
+valid_name() {
+  case "$1" in ''|*[!A-Za-z0-9_.-]*|.|..) return 1 ;; *) return 0 ;; esac
+}
+need_name() {
+  [ -n "$NAME" ] || die "Usage: ovpnman $ACTION <client-name>"
+  valid_name "$NAME" || die "Client name may contain only letters, numbers, dot, underscore, and hyphen."
+}
+
+ask_yn() {
+  prompt="$1"
+  while :; do
+    printf "%s [y/N]: " "$prompt" >&2
+    read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES|Yes) return 0 ;;
+      ''|n|N|no|NO|No) return 1 ;;
+      *) echo "Please answer y or n." >&2 ;;
+    esac
+  done
+}
+
+ask_value() {
+  prompt="$1"
+  printf "%s: " "$prompt" >&2
+  read -r answer || answer=""
+  printf "%s" "$answer"
+}
 
 ensure() {
   [ "$(id -u)" = "0" ] || die "Run as root."
@@ -794,6 +820,8 @@ ensure() {
   [ -x "$EASYRSA_DIR/easyrsa" ] || die "Missing $EASYRSA_DIR/easyrsa"
   mkdir -p "$OUTDIR"
   chmod 700 "$OUTDIR"
+  mkdir -p "$CCD_DIR"
+  chmod 700 "$CCD_DIR"
 }
 
 server_value() {
@@ -858,6 +886,186 @@ restart_openvpn() {
     systemctl restart openvpn >/dev/null 2>&1 && return 0
   fi
   return 1
+}
+
+normalize_cidr() {
+  awk -v cidr="$1" '
+    function fail() { exit 1 }
+    BEGIN {
+      if (cidr !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/) fail()
+      split(cidr, p, "/"); prefix = p[2] + 0
+      if (prefix < 1 || prefix > 32) fail()
+      split(p[1], o, ".")
+      value = 0
+      for (i = 1; i <= 4; i++) {
+        if (o[i] < 0 || o[i] > 255) fail()
+        value = value * 256 + o[i]
+      }
+      block = 2 ^ (32 - prefix)
+      network = int(value / block) * block
+      for (i = 4; i >= 1; i--) {
+        n[i] = network % 256
+        network = int(network / 256)
+      }
+      mask_value = 4294967296 - block
+      for (i = 4; i >= 1; i--) {
+        m[i] = mask_value % 256
+        mask_value = int(mask_value / 256)
+      }
+      printf "%d.%d.%d.%d %d.%d.%d.%d %d\n", n[1], n[2], n[3], n[4], m[1], m[2], m[3], m[4], prefix
+    }
+  '
+}
+
+validate_static_ip() {
+  ip="$1"
+  server_line="$(awk '$1 == "server" && NF == 3 {print $2 " " $3; exit}' "$SERVER_CONF")"
+  [ -n "$server_line" ] || die "Cannot determine VPN subnet from $SERVER_CONF."
+  set -- $server_line
+  awk -v ip="$ip" -v net="$1" -v mask="$2" '
+    function ipnum(s, a, j) {
+      if (s !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return -1
+      split(s, a, ".")
+      for (j = 1; j <= 4; j++) if (a[j] < 0 || a[j] > 255) return -1
+      return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+    }
+    BEGIN {
+      i = ipnum(ip); n = ipnum(net); m = ipnum(mask)
+      if (i < 0 || n < 0 || m < 0) exit 1
+      size = 4294967296 - m
+      broadcast = n + size - 1
+      if (i <= n + 1 || i >= broadcast) exit 1
+    }
+  ' || die "Static IP $ip must be a usable client address inside the VPN subnet and cannot be the server IP."
+}
+
+static_ip_in_use() {
+  wanted="$1"
+  exclude="$2"
+  for file in "$CCD_DIR"/*; do
+    [ -f "$file" ] || continue
+    [ "$(basename "$file")" = "$exclude" ] && continue
+    awk -v ip="$wanted" '$1 == "ifconfig-push" && $2 == ip {found=1} END {exit found ? 0 : 1}' "$file" && return 0
+  done
+  return 1
+}
+
+behind_subnet_in_use() {
+  network="$1"
+  netmask="$2"
+  exclude="$3"
+  for file in "$CCD_DIR"/*; do
+    [ -f "$file" ] || continue
+    [ "$(basename "$file")" = "$exclude" ] && continue
+    awk -v n="$network" -v m="$netmask" '$1 == "iroute" && $2 == n && $3 == m {found=1} END {exit found ? 0 : 1}' "$file" && return 0
+  done
+  return 1
+}
+
+rebuild_ccd_server_routes() {
+  tmp="$SERVER_CONF.ccd-tmp"
+  awk '
+    $0 == "# BEGIN OVPNMAN CCD ROUTES" {managed=1; next}
+    $0 == "# END OVPNMAN CCD ROUTES" {managed=0; next}
+    managed {next}
+    $1 == "client-config-dir" {next}
+    {print}
+  ' "$SERVER_CONF" > "$tmp"
+
+  {
+    cat "$tmp"
+    echo
+    echo "client-config-dir $CCD_DIR"
+    echo "# BEGIN OVPNMAN CCD ROUTES"
+    for file in "$CCD_DIR"/*; do
+      [ -f "$file" ] || continue
+      awk '$1 == "iroute" && NF == 3 {
+        print "route " $2 " " $3
+        print "push \"route " $2 " " $3 "\""
+      }' "$file"
+    done | sort -u
+    echo "# END OVPNMAN CCD ROUTES"
+  } > "$SERVER_CONF.new"
+  mv "$SERVER_CONF.new" "$SERVER_CONF"
+  rm -f "$tmp"
+  chmod 644 "$SERVER_CONF"
+}
+
+ccd_set() {
+  [ "$#" -ge 3 ] || die "Usage: ovpnman ccd-set <client-name> <static-vpn-ip> [behind-subnet-cidr ...]"
+  name="$2"
+  static_ip="$3"
+  shift 3
+  ensure
+  valid_name "$name" || die "Client name may contain only letters, numbers, dot, underscore, and hyphen."
+  [ -f "$EASYRSA_DIR/pki/issued/$name.crt" ] || die "Unknown client certificate: $name"
+  validate_static_ip "$static_ip"
+  static_ip_in_use "$static_ip" "$name" && die "Static VPN IP is already assigned: $static_ip"
+
+  tmp="$CCD_DIR/$name.tmp"
+  vpn_mask="$(awk '$1 == "server" && NF == 3 {print $3; exit}' "$SERVER_CONF")"
+  [ -n "$vpn_mask" ] || die "Cannot determine VPN netmask from $SERVER_CONF."
+  echo "ifconfig-push $static_ip $vpn_mask" > "$tmp"
+  for cidr in "$@"; do
+    normalized="$(normalize_cidr "$cidr" 2>/dev/null || true)"
+    [ -n "$normalized" ] || { rm -f "$tmp"; die "Invalid behind-client subnet: $cidr"; }
+    set -- $normalized
+    behind_subnet_in_use "$1" "$2" "$name" && { rm -f "$tmp"; die "Behind-client subnet is already assigned: $1/$3"; }
+    echo "iroute $1 $2" >> "$tmp"
+    echo "push-remove \"route $1 $2\"" >> "$tmp"
+  done
+  mv "$tmp" "$CCD_DIR/$name"
+  chmod 600 "$CCD_DIR/$name"
+  rebuild_ccd_server_routes
+  restart_openvpn || die "CCD saved, but OpenVPN restart failed."
+  echo "CCD configured for $name:"
+  cat "$CCD_DIR/$name"
+}
+
+ccd_show() {
+  ensure
+  if [ -n "$NAME" ]; then
+    [ -f "$CCD_DIR/$NAME" ] || die "No CCD configuration for $NAME"
+    echo "[$NAME]"
+    cat "$CCD_DIR/$NAME"
+    return 0
+  fi
+  for file in "$CCD_DIR"/*; do
+    [ -f "$file" ] || continue
+    echo "[$(basename "$file")]"
+    cat "$file"
+  done
+}
+
+ccd_remove() {
+  need_name
+  ensure
+  [ -f "$CCD_DIR/$NAME" ] || die "No CCD configuration for $NAME"
+  rm -f "$CCD_DIR/$NAME"
+  rebuild_ccd_server_routes
+  restart_openvpn || die "CCD removed, but OpenVPN restart failed."
+  echo "CCD removed for $NAME"
+}
+
+ccd_sync() {
+  ensure
+  rebuild_ccd_server_routes
+  echo "CCD server routes synchronized."
+}
+
+offer_ccd_setup() {
+  name="$1"
+  [ -t 0 ] || return 0
+  ask_yn "Configure a static VPN IP or behind-client subnet for $name?" || return 0
+  static_ip="$(ask_value "Static VPN IP for $name")"
+  [ -n "$static_ip" ] || die "Static VPN IP is required for CCD setup."
+  set -- ccd-set "$name" "$static_ip"
+  while ask_yn "Add a subnet behind $name?"; do
+    cidr="$(ask_value "Behind-client subnet in CIDR form")"
+    [ -n "$cidr" ] || die "Subnet cannot be empty."
+    set -- "$@" "$cidr"
+  done
+  ccd_set "$@"
 }
 
 list_clients() {
@@ -928,6 +1136,7 @@ EOF2
   chmod 600 "$final"
   trap - INT TERM HUP
   echo "$final"
+  offer_ccd_setup "$NAME"
 }
 
 revoke_client() {
@@ -958,6 +1167,8 @@ revoke_client() {
     echo 'crl-verify crl.pem' >> "$SERVER_CONF"
 
   rm -f "$OUTDIR/$NAME.ovpn" "$OUTDIR/$NAME.ovpn.tmp" 2>/dev/null || true
+  rm -f "$CCD_DIR/$NAME" 2>/dev/null || true
+  rebuild_ccd_server_routes
   restart_openvpn || true
   echo "revoked: $NAME"
 }
@@ -967,6 +1178,7 @@ show_config() {
   refresh_runtime_defaults
   echo "EASYRSA_DIR=$EASYRSA_DIR"
   echo "OUTDIR=$OUTDIR"
+  echo "CCD_DIR=$CCD_DIR"
   echo "REMOTE_HOST=$REMOTE_HOST"
   echo "REMOTE_PORT=$REMOTE_PORT"
   echo "REMOTE_PROTO=$REMOTE_PROTO"
@@ -978,12 +1190,20 @@ case "$ACTION" in
   list) list_clients ;;
   add) add_client ;;
   revoke) revoke_client ;;
+  ccd-set) ccd_set "$@" ;;
+  ccd-show) ccd_show ;;
+  ccd-remove) ccd_remove ;;
+  ccd-sync) ccd_sync ;;
   config) show_config ;;
   *)
     echo "Usage:"
     echo "  ovpnman list"
     echo "  ovpnman add <client-name>"
     echo "  ovpnman revoke <client-name>"
+    echo "  ovpnman ccd-set <client-name> <static-vpn-ip> [behind-subnet-cidr ...]"
+    echo "  ovpnman ccd-show [client-name]"
+    echo "  ovpnman ccd-remove <client-name>"
+    echo "  ovpnman ccd-sync"
     echo "  ovpnman config"
     exit 1
     ;;
@@ -1004,6 +1224,7 @@ OVPNMAN_EOF
     -e "s|__AUTH__|$auth_esc|g" \
     "$OVPNMAN"
   chmod 755 "$OVPNMAN"
+  "$OVPNMAN" ccd-sync
 }
 
 restart_service() {
