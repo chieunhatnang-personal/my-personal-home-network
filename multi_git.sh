@@ -10,6 +10,7 @@ SSH_DIR="${MULTI_GIT_SSH_DIR:-${HOME}/.ssh}"
 SSH_CONFIG="${SSH_DIR}/config"
 LIBSECRET_INSTALL_DIR="${MULTI_GIT_LIBEXEC_DIR:-${HOME}/.local/libexec/multi_git}"
 LIBSECRET_HELPER_PATH="${LIBSECRET_INSTALL_DIR}/git-credential-libsecret"
+GITHUB_REPO_LIMIT="${MULTI_GIT_GITHUB_REPO_LIMIT:-200}"
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -40,6 +41,8 @@ What it does:
             press Enter to return. The script exits only when Quit is chosen.
   add acc   Add an SSH-key account or an HTTPS username/password account,
             and save local-only Git identity metadata.
+  list acc  Display saved accounts and the full public key for every SSH
+            account, ready to add to GitHub or another Git server.
   add repo  Configure the current Git repo or clone a repo using one of the
             saved account aliases, then set local user.name/user.email.
   del acc   Remove a saved account and, for SSH accounts, its managed
@@ -66,6 +69,8 @@ multi_git account registry:
     - Git server hostname and SSH host alias, or HTTPS server base URL.
     - SSH private-key path, or HTTPS username.
     - Commit identity: Git user.name and user.email.
+    - Default GitHub user/organization for repository discovery.
+    - GitHub CLI login associated with the account alias.
 
   It does NOT contain:
     - SSH private-key contents.
@@ -82,6 +87,27 @@ Saved repository registry:
   Stores account-alias to repository-path mappings, such as team/project.
   This list powers the interactive repo picker. It is only a local convenience
   index; it does not clone, mirror, or contain repository data.
+
+GitHub repository discovery:
+  - GitHub accounts store a default user/organization and gh login in the
+    account registry.
+  - Selecting Fetch uses that saved value and automatically requests up to
+    ${GITHUB_REPO_LIMIT} repositories. It does not ask for the owner or count
+    again.
+  - Before fetching, multi_git switches gh to the login associated with the
+    selected account. Multiple gh logins can remain stored and be reused
+    without manually running "gh auth switch".
+  - SSH authentication and GitHub CLI authentication are separate. An SSH key
+    can clone and push successfully while "gh repo list" still fails because
+    gh has no active login. When needed, Fetch offers to start "gh auth login".
+    Inspect the active GitHub CLI login with:
+      gh auth status --hostname github.com
+  - GitHub CLI owns and stores its API token. multi_git never reads or writes
+    that token. gh normally uses the operating-system credential store and may
+    fall back to its own configuration file; "gh auth status" reports where
+    the active token is stored.
+  - A failed fetch reports the gh error and returns to repo selection. Manual
+    repo entry is used only when explicitly selected.
 
 SSH authentication storage:
   - Private and public keys are separate files at the key path selected while
@@ -147,6 +173,9 @@ Shared Windows/Linux repositories:
 Deletion behavior:
   - "del acc" removes the account registry entry, its saved repo choices, and
     its managed SSH block. SSH key files are deleted only after confirmation.
+  - "del acc" does not log out the associated gh account or delete its token.
+    GitHub CLI authentication is shared independently and can be inspected or
+    removed with "gh auth status" and "gh auth logout".
   - "del acc" does not erase credentials previously retained by an external
     OS credential helper or remove URL-scoped entries from global Git config.
   - "del repo" removes origin only after confirmation and can unset the local
@@ -160,6 +189,8 @@ Path overrides:
   - MULTI_GIT_SSH_DIR overrides the SSH directory.
   - MULTI_GIT_LIBEXEC_DIR overrides the user-local helper installation
     directory.
+  - MULTI_GIT_GITHUB_REPO_LIMIT overrides the default GitHub fetch limit of
+    ${GITHUB_REPO_LIMIT}.
 EOF
 }
 
@@ -169,7 +200,7 @@ ensure_config() {
 
     if [[ ! -f "$ACCOUNTS_FILE" ]]; then
         {
-            printf '# alias\tauth_type\thost_alias\thost_name\tkey_path\tauth_username\tbase_url\tuser_name\tuser_email\n'
+            printf '# alias\tauth_type\thost_alias\thost_name\tkey_path\tauth_username\tbase_url\tuser_name\tuser_email\trepo_namespace\tgithub_login\n'
         } >"$ACCOUNTS_FILE"
     fi
 
@@ -266,6 +297,14 @@ validate_tsv_value() {
     }
 }
 
+validate_github_login() {
+    local login="$1"
+
+    [[ "$login" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ && "$login" != *- ]] || {
+        die "GitHub login must contain only letters, numbers, or hyphens and cannot start or end with a hyphen."
+    }
+}
+
 parse_account_line() {
     local line="$1"
     local fields=()
@@ -284,6 +323,8 @@ parse_account_line() {
         PARSED_ACCOUNT_BASE_URL="${fields[6]:--}"
         PARSED_ACCOUNT_USER_NAME="${fields[7]:-}"
         PARSED_ACCOUNT_USER_EMAIL="${fields[8]:-}"
+        PARSED_ACCOUNT_REPO_NAMESPACE="${fields[9]:--}"
+        PARSED_ACCOUNT_GITHUB_LOGIN="${fields[10]:--}"
     else
         # Backward compatibility for the original SSH-only six-column format.
         PARSED_ACCOUNT_AUTH_TYPE='ssh'
@@ -294,6 +335,8 @@ parse_account_line() {
         PARSED_ACCOUNT_BASE_URL='-'
         PARSED_ACCOUNT_USER_NAME="${fields[4]:-}"
         PARSED_ACCOUNT_USER_EMAIL="${fields[5]:-}"
+        PARSED_ACCOUNT_REPO_NAMESPACE='-'
+        PARSED_ACCOUNT_GITHUB_LOGIN='-'
     fi
 }
 
@@ -310,6 +353,8 @@ load_account() {
     ACCOUNT_BASE_URL=''
     ACCOUNT_USER_NAME=''
     ACCOUNT_USER_EMAIL=''
+    ACCOUNT_REPO_NAMESPACE=''
+    ACCOUNT_GITHUB_LOGIN=''
 
     [[ -f "$ACCOUNTS_FILE" ]] || return 1
 
@@ -326,6 +371,8 @@ load_account() {
             ACCOUNT_BASE_URL="$PARSED_ACCOUNT_BASE_URL"
             ACCOUNT_USER_NAME="$PARSED_ACCOUNT_USER_NAME"
             ACCOUNT_USER_EMAIL="$PARSED_ACCOUNT_USER_EMAIL"
+            ACCOUNT_REPO_NAMESPACE="$PARSED_ACCOUNT_REPO_NAMESPACE"
+            ACCOUNT_GITHUB_LOGIN="$PARSED_ACCOUNT_GITHUB_LOGIN"
             return 0
         fi
     done <"$ACCOUNTS_FILE"
@@ -358,6 +405,12 @@ load_account_menu() {
             display_auth="$PARSED_ACCOUNT_HOST_ALIAS -> $PARSED_ACCOUNT_KEY_PATH"
         else
             display_auth="username: $PARSED_ACCOUNT_AUTH_USERNAME"
+        fi
+        if [[ "$PARSED_ACCOUNT_REPO_NAMESPACE" != "-" ]]; then
+            display_auth="$display_auth; repos: $PARSED_ACCOUNT_REPO_NAMESPACE"
+        fi
+        if [[ "$PARSED_ACCOUNT_GITHUB_LOGIN" != "-" ]]; then
+            display_auth="$display_auth; gh: $PARSED_ACCOUNT_GITHUB_LOGIN"
         fi
 
         ACCOUNT_MENU_ALIASES+=("$PARSED_ACCOUNT_ALIAS")
@@ -515,6 +568,7 @@ load_repo_menu() {
     while IFS=$'\t' read -r line_alias line_repo_path; do
         [[ -n "${line_alias:-}" ]] || continue
         [[ "$line_alias" == \#* ]] && continue
+        [[ -n "${line_repo_path:-}" ]] || continue
 
         if [[ "$line_alias" == "$account_alias" ]]; then
             REPO_MENU_PATHS+=("$line_repo_path")
@@ -522,10 +576,18 @@ load_repo_menu() {
     done <"$REPOS_FILE"
 }
 
+github_repo_fetch_label() {
+    if [[ -n "${ACCOUNT_REPO_NAMESPACE:-}" && "$ACCOUNT_REPO_NAMESPACE" != "-" ]]; then
+        printf 'Fetch available GitHub repos for %s' "$ACCOUNT_REPO_NAMESPACE"
+    else
+        printf 'Fetch available repos from GitHub'
+    fi
+}
+
 print_repo_menu() {
     local account_alias="$1"
     local i
-    local fetch_number manual_number extra_items=0
+    local fetch_number manual_number extra_items=0 fetch_label
 
     printf 'Saved repos for account "%s":\n' "$account_alias" >&2
     printf '  %-4s %s\n' "NO." "REPO" >&2
@@ -537,7 +599,8 @@ print_repo_menu() {
     if (( REPO_GITHUB_FETCH_ENABLED )); then
         fetch_number=$((${#REPO_MENU_PATHS[@]} + 1))
         extra_items=1
-        printf '  %-4s %s\n' "${fetch_number}." "Fetch from GitHub with gh" >&2
+        fetch_label="$(github_repo_fetch_label)"
+        printf '  %-4s %s\n' "${fetch_number}." "$fetch_label" >&2
     fi
     manual_number=$((${#REPO_MENU_PATHS[@]} + extra_items + 1))
     printf '  %-4s %s\n' "${manual_number}." "Enter repo manually" >&2
@@ -563,7 +626,7 @@ draw_repo_arrow_menu() {
         manual_index=$((${#REPO_MENU_PATHS[@]} + 1))
         marker=' '
         [[ "$fetch_index" -eq "$selected" ]] && marker='>'
-        label='Fetch from GitHub with gh'
+        label="$(github_repo_fetch_label)"
         printf ' %s %2s) %s\n' "$marker" "$((fetch_index + 1))" "$label" >&2
     fi
 
@@ -661,6 +724,86 @@ select_repo_numbered() {
     done
 }
 
+github_cli_active_login() {
+    gh api user --jq '.login' 2>/dev/null
+}
+
+github_logins_match() {
+    local first="$1"
+    local second="$2"
+
+    [[ "${first,,}" == "${second,,}" ]]
+}
+
+ensure_github_cli_auth() {
+    local github_login="$1"
+    local active_login=''
+
+    if ! command -v gh >/dev/null 2>&1; then
+        info "GitHub CLI 'gh' is not installed or not in PATH." >&2
+        return 1
+    fi
+
+    if [[ -n "${GH_TOKEN:-}" || -n "${GITHUB_TOKEN:-}" ]]; then
+        active_login="$(github_cli_active_login || true)"
+        if [[ -n "$active_login" ]] && github_logins_match "$active_login" "$github_login"; then
+            info "Using GitHub API token from the environment as '$active_login'." >&2
+            return 0
+        fi
+
+        info "GH_TOKEN or GITHUB_TOKEN is overriding stored GitHub CLI accounts." >&2
+        if [[ -n "$active_login" ]]; then
+            info "The environment token belongs to '$active_login', not '$github_login'." >&2
+        else
+            info "The environment token is invalid or cannot access the GitHub API." >&2
+        fi
+        info "Unset the environment token to let multi_git switch stored gh accounts." >&2
+        return 1
+    fi
+
+    if gh auth token --hostname github.com --user "$github_login" >/dev/null 2>&1; then
+        if gh auth switch --hostname github.com --user "$github_login" >/dev/null 2>&1; then
+            active_login="$(github_cli_active_login || true)"
+            if [[ -n "$active_login" ]] && github_logins_match "$active_login" "$github_login"; then
+                info "Using stored GitHub CLI login '$active_login'." >&2
+                return 0
+            fi
+        fi
+
+        info "Stored GitHub CLI credentials for '$github_login' are not usable." >&2
+    fi
+
+    info "GitHub CLI has no usable stored login for '$github_login'." >&2
+    info "Your SSH key remains responsible for Git clone, pull, and push." >&2
+    if ! confirm "Authenticate GitHub CLI as '$github_login' now?" "yes"; then
+        info "Repository fetch skipped. Run 'gh auth login' later or select manual entry." >&2
+        return 1
+    fi
+
+    info "Starting GitHub CLI authentication..." >&2
+    if ! gh auth login --hostname github.com >&2; then
+        info "GitHub CLI authentication did not complete." >&2
+        return 1
+    fi
+
+    if gh auth token --hostname github.com --user "$github_login" >/dev/null 2>&1; then
+        gh auth switch --hostname github.com --user "$github_login" >/dev/null 2>&1 || true
+    fi
+    active_login="$(github_cli_active_login || true)"
+    if [[ -z "$active_login" ]]; then
+        info "GitHub CLI still has no valid login for github.com." >&2
+        return 1
+    fi
+    if ! github_logins_match "$active_login" "$github_login"; then
+        info "GitHub CLI authenticated as '$active_login', but this account expects '$github_login'." >&2
+        info "Authenticate the expected account or update its multi_git configuration." >&2
+        return 1
+    fi
+
+    info "GitHub CLI authentication is ready as '$active_login'." >&2
+    return 0
+}
+
 load_github_repo_menu() {
     local owner="$1"
     local limit="$2"
@@ -673,8 +816,11 @@ load_github_repo_menu() {
         return 1
     fi
 
-    if ! repo_list="$(gh repo list "$owner" --limit "$limit" --json nameWithOwner --jq '.[].nameWithOwner')"; then
-        info "Could not fetch repos with gh. Check gh auth, network, and the user/org name." >&2
+    if ! repo_list="$(gh repo list "$owner" --limit "$limit" --json nameWithOwner --jq '.[].nameWithOwner' 2>&1)"; then
+        info "GitHub repository fetch failed:" >&2
+        printf '%s\n' "$repo_list" >&2
+        info "The selected SSH key authenticates Git operations, but gh uses its own login." >&2
+        info "Check it with: gh auth status --hostname github.com" >&2
         return 1
     fi
 
@@ -683,7 +829,13 @@ load_github_repo_menu() {
         GITHUB_REPO_MENU_PATHS+=("$line")
     done <<<"$repo_list"
 
-    (( ${#GITHUB_REPO_MENU_PATHS[@]} > 0 ))
+    if (( ${#GITHUB_REPO_MENU_PATHS[@]} == 0 )); then
+        info "GitHub returned no repositories for '$owner'." >&2
+        info "Check the saved user/org and the active gh login." >&2
+        return 1
+    fi
+
+    return 0
 }
 
 print_github_repo_menu() {
@@ -792,20 +944,28 @@ select_github_repo_numbered() {
 }
 
 choose_github_repo_input() {
-    local owner limit selected repo_input
+    local owner github_login selected repo_input
 
-    owner="$(prompt_required "GitHub user/org to list repos")"
-    limit="$(prompt_default "Max repos to fetch" "100")"
-
-    if [[ ! "$limit" =~ ^[0-9]+$ || "$limit" -lt 1 ]]; then
-        die "Max repos must be a positive number."
+    owner="${ACCOUNT_REPO_NAMESPACE:-}"
+    if [[ -z "$owner" || "$owner" == "-" ]]; then
+        owner="$(prompt_required "Default GitHub user/org for repository listing")"
+        validate_tsv_value "GitHub user/org" "$owner"
+        save_account_repo_namespace "$ACCOUNT_ALIAS" "$owner"
+        info "Saved GitHub user/org '$owner' for account '$ACCOUNT_ALIAS'." >&2
     fi
 
-    if ! load_github_repo_menu "$owner" "$limit"; then
-        repo_input="$(prompt_required "Repo path or URL, e.g. namespace/repo")"
-        repo_path_from_input "$repo_input"
-        return
+    github_login="${ACCOUNT_GITHUB_LOGIN:-}"
+    if [[ -z "$github_login" || "$github_login" == "-" ]]; then
+        github_login="$(prompt_default "GitHub login used by gh for account '$ACCOUNT_ALIAS'" "$owner")"
+        validate_github_login "$github_login"
+        save_account_github_login "$ACCOUNT_ALIAS" "$github_login"
+        info "Saved gh login '$github_login' for account '$ACCOUNT_ALIAS'." >&2
     fi
+
+    [[ "$GITHUB_REPO_LIMIT" =~ ^[0-9]+$ && "$GITHUB_REPO_LIMIT" -gt 0 ]] || \
+        die "MULTI_GIT_GITHUB_REPO_LIMIT must be a positive number."
+    ensure_github_cli_auth "$github_login" || return 1
+    load_github_repo_menu "$owner" "$GITHUB_REPO_LIMIT" || return 1
 
     if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
         selected="$(select_github_repo_arrow "$owner")"
@@ -826,26 +986,34 @@ choose_repo_input() {
     local account_alias="$1"
     local selected repo_input
 
-    load_repo_menu "$account_alias"
+    while true; do
+        load_account "$account_alias" || die "Unknown account alias: $account_alias"
+        load_repo_menu "$account_alias"
 
-    if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
-        selected="$(select_repo_arrow "$account_alias")"
-    else
-        selected="$(select_repo_numbered "$account_alias")"
-    fi
+        if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
+            selected="$(select_repo_arrow "$account_alias")"
+        else
+            selected="$(select_repo_numbered "$account_alias")"
+        fi
 
-    if [[ "$selected" == "__fetch__" ]]; then
-        choose_github_repo_input
+        if [[ "$selected" == "__fetch__" ]]; then
+            if repo_input="$(choose_github_repo_input)"; then
+                printf '%s' "$repo_input"
+                return
+            fi
+            info "Returning to repository selection. Choose Fetch to retry or Manual entry to type a path." >&2
+            continue
+        fi
+
+        if [[ "$selected" != "__manual__" ]]; then
+            printf '%s' "$selected"
+            return
+        fi
+
+        repo_input="$(prompt_required "Repo path or URL, e.g. namespace/repo")"
+        repo_path_from_input "$repo_input"
         return
-    fi
-
-    if [[ "$selected" != "__manual__" ]]; then
-        printf '%s' "$selected"
-        return
-    fi
-
-    repo_input="$(prompt_required "Repo path or URL, e.g. namespace/repo")"
-    repo_path_from_input "$repo_input"
+    done
 }
 
 print_mode_menu() {
@@ -1186,6 +1354,7 @@ save_repo() {
     local repo_path="$2"
     local tmp_file
 
+    [[ -n "$repo_path" ]] || die "Repo path cannot be empty."
     validate_tsv_value "Repo path" "$repo_path"
 
     tmp_file="$(mktemp)"
@@ -1223,19 +1392,44 @@ save_account() {
     local base_url="$7"
     local user_name="$8"
     local user_email="$9"
+    local repo_namespace="${10}"
+    local github_login="${11}"
     local tmp_file
 
     tmp_file="$(mktemp)"
-    printf '# alias\tauth_type\thost_alias\thost_name\tkey_path\tauth_username\tbase_url\tuser_name\tuser_email\n' >"$tmp_file"
+    printf '# alias\tauth_type\thost_alias\thost_name\tkey_path\tauth_username\tbase_url\tuser_name\tuser_email\trepo_namespace\tgithub_login\n' >"$tmp_file"
     awk -F '\t' -v alias="$alias" '
         BEGIN { OFS = FS }
         NF && $1 !~ /^#/ && $1 != alias { print }
     ' "$ACCOUNTS_FILE" >>"$tmp_file"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$alias" "$auth_type" "$host_alias" "$host_name" "$key_path" \
-        "$auth_username" "$base_url" "$user_name" "$user_email" >>"$tmp_file"
+        "$auth_username" "$base_url" "$user_name" "$user_email" \
+        "$repo_namespace" "$github_login" >>"$tmp_file"
     mv "$tmp_file" "$ACCOUNTS_FILE"
     chmod 600 "$ACCOUNTS_FILE" 2>/dev/null || true
+}
+
+save_account_repo_namespace() {
+    local alias="$1"
+    local repo_namespace="$2"
+
+    load_account "$alias" || return 1
+    save_account "$ACCOUNT_ALIAS" "$ACCOUNT_AUTH_TYPE" "$ACCOUNT_HOST_ALIAS" \
+        "$ACCOUNT_HOST_NAME" "$ACCOUNT_KEY_PATH" "$ACCOUNT_AUTH_USERNAME" \
+        "$ACCOUNT_BASE_URL" "$ACCOUNT_USER_NAME" "$ACCOUNT_USER_EMAIL" \
+        "$repo_namespace" "$ACCOUNT_GITHUB_LOGIN"
+}
+
+save_account_github_login() {
+    local alias="$1"
+    local github_login="$2"
+
+    load_account "$alias" || return 1
+    save_account "$ACCOUNT_ALIAS" "$ACCOUNT_AUTH_TYPE" "$ACCOUNT_HOST_ALIAS" \
+        "$ACCOUNT_HOST_NAME" "$ACCOUNT_KEY_PATH" "$ACCOUNT_AUTH_USERNAME" \
+        "$ACCOUNT_BASE_URL" "$ACCOUNT_USER_NAME" "$ACCOUNT_USER_EMAIL" \
+        "$ACCOUNT_REPO_NAMESPACE" "$github_login"
 }
 
 delete_account_record() {
@@ -1333,7 +1527,8 @@ choose_account_alias() {
 }
 
 list_accounts() {
-    local i
+    local i alias public_key
+    local ssh_account_found=0
 
     ensure_config
 
@@ -1351,6 +1546,29 @@ list_accounts() {
             "${ACCOUNT_MENU_HOST_NAMES[$i]}" \
             "${ACCOUNT_MENU_AUTH_DETAILS[$i]}"
     done
+
+    for alias in "${ACCOUNT_MENU_ALIASES[@]}"; do
+        load_account "$alias" || continue
+        [[ "$ACCOUNT_AUTH_TYPE" == "ssh" ]] || continue
+        ssh_account_found=1
+        public_key="${ACCOUNT_KEY_PATH}.pub"
+
+        info ""
+        info "SSH public key for account '$alias':"
+        info "  File: $public_key"
+        if [[ -f "$public_key" ]]; then
+            info "  Key:"
+            cat "$public_key"
+        else
+            info "  Status: public key file not found"
+        fi
+    done
+
+    if (( ssh_account_found )); then
+        info ""
+        info "Public keys are safe to share. Never share the private key file."
+        info "GitHub: Settings -> SSH and GPG keys -> New SSH key."
+    fi
 }
 
 add_account() {
@@ -1358,6 +1576,8 @@ add_account() {
     local auth_type='ssh' existing_auth_type='ssh'
     local host_alias host_name key_path default_key_path user_name user_email
     local auth_username base_url default_host_alias default_host_name default_key
+    local repo_namespace='-' default_repo_namespace=''
+    local github_login='-' default_github_login=''
 
     ensure_config
 
@@ -1394,6 +1614,25 @@ add_account() {
 
         host_alias="$(prompt_default "SSH host alias" "$default_host_alias")"
         host_name="$(prompt_default "Git host name" "$default_host_name")"
+        if [[ "$host_name" == "github.com" ]]; then
+            if [[ "$existing_auth_type" == "ssh" && "${ACCOUNT_REPO_NAMESPACE:-}" != "-" ]]; then
+                default_repo_namespace="$ACCOUNT_REPO_NAMESPACE"
+            fi
+            if [[ -n "$default_repo_namespace" ]]; then
+                repo_namespace="$(prompt_default "Default GitHub user/org for repository listing" "$default_repo_namespace")"
+            else
+                repo_namespace="$(prompt_required "Default GitHub user/org for repository listing")"
+            fi
+            validate_tsv_value "GitHub user/org" "$repo_namespace"
+
+            if [[ -n "${ACCOUNT_GITHUB_LOGIN:-}" && "$ACCOUNT_GITHUB_LOGIN" != "-" ]]; then
+                default_github_login="$ACCOUNT_GITHUB_LOGIN"
+            else
+                default_github_login="$repo_namespace"
+            fi
+            github_login="$(prompt_default "GitHub login used by gh" "$default_github_login")"
+            validate_github_login "$github_login"
+        fi
         default_key_path="$default_key"
         key_path="$(prompt_default "SSH key path" "$default_key_path")"
         key_path="$(expand_path "$key_path")"
@@ -1420,7 +1659,8 @@ add_account() {
 
         write_ssh_block "$alias" "$host_alias" "$host_name" "$key_path"
         save_account "$alias" "ssh" "$host_alias" "$host_name" "$key_path" \
-            "git" "-" "$user_name" "$user_email"
+            "git" "-" "$user_name" "$user_email" "$repo_namespace" \
+            "$github_login"
 
         info ""
         info "Saved SSH account '$alias'."
@@ -1445,12 +1685,33 @@ add_account() {
         host_name="${base_url#*://}"
         host_name="${host_name%%/*}"
 
+        if [[ "$host_name" == "github.com" ]]; then
+            if [[ "$existing_auth_type" == "https" && "${ACCOUNT_REPO_NAMESPACE:-}" != "-" ]]; then
+                default_repo_namespace="$ACCOUNT_REPO_NAMESPACE"
+            fi
+            if [[ -n "$default_repo_namespace" ]]; then
+                repo_namespace="$(prompt_default "Default GitHub user/org for repository listing" "$default_repo_namespace")"
+            else
+                repo_namespace="$(prompt_required "Default GitHub user/org for repository listing")"
+            fi
+            validate_tsv_value "GitHub user/org" "$repo_namespace"
+
+            if [[ -n "${ACCOUNT_GITHUB_LOGIN:-}" && "$ACCOUNT_GITHUB_LOGIN" != "-" ]]; then
+                default_github_login="$ACCOUNT_GITHUB_LOGIN"
+            else
+                default_github_login="$repo_namespace"
+            fi
+            github_login="$(prompt_default "GitHub login used by gh" "$default_github_login")"
+            validate_github_login "$github_login"
+        fi
+
         validate_tsv_value "Git server URL" "$base_url"
         validate_tsv_value "Git server username" "$auth_username"
 
         remove_ssh_block "$alias"
         save_account "$alias" "https" "-" "$host_name" "-" \
-            "$auth_username" "$base_url" "$user_name" "$user_email"
+            "$auth_username" "$base_url" "$user_name" "$user_email" \
+            "$repo_namespace" "$github_login"
         configure_os_https_credentials "$base_url" "$auth_username"
 
         info ""
@@ -1482,6 +1743,9 @@ delete_account() {
     delete_account_record "$alias"
     delete_account_repos "$alias"
     info "Removed account '$alias' from multi_git."
+    if [[ "$ACCOUNT_GITHUB_LOGIN" != "-" ]]; then
+        info "Kept GitHub CLI login '$ACCOUNT_GITHUB_LOGIN'; gh manages that token independently."
+    fi
 
     if [[ "$ACCOUNT_AUTH_TYPE" == "ssh" && ( -f "$ACCOUNT_KEY_PATH" || -f "${ACCOUNT_KEY_PATH}.pub" ) ]]; then
         if confirm "Delete SSH key files for '$alias'?" "no"; then
@@ -1686,7 +1950,7 @@ draw_main_menu() {
     local actions=(
         "Add account"
         "Delete account"
-        "List accounts"
+        "List accounts and SSH public keys"
         "Add or configure repository"
         "Remove current repository configuration"
         "Show current repository"
@@ -1755,7 +2019,7 @@ print_main_menu_numbered() {
     printf 'Working directory: %s\n\n' "$PWD" >&2
     printf '  1. Add account\n' >&2
     printf '  2. Delete account\n' >&2
-    printf '  3. List accounts\n' >&2
+    printf '  3. List accounts and SSH public keys\n' >&2
     printf '  4. Add or configure repository\n' >&2
     printf '  5. Remove current repository configuration\n' >&2
     printf '  6. Show current repository\n' >&2
