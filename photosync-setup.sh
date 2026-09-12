@@ -1116,6 +1116,10 @@ restic_controller_command() {
         restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" init
       ;;
     backup)
+      # Interrupted network sessions leave repository locks behind. Restic's
+      # normal unlock removes only stale locks and preserves active ones.
+      restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
+        unlock
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
         backup --compression "$COMPRESSION" --tag "photosync-$SERVER_ID" "${SOURCE_PATHS[@]}" "$@"
       ;;
@@ -1144,13 +1148,16 @@ write_controller_jobs() {
   local id=$1 service timer maintenance_service maintenance_timer
   load_controller_server "$id"
   install -m 0700 -o root -g root "$(readlink -f "$0")" "$RESTIC_INSTALL_PATH"
+  install -d -m 0700 -o root -g root /var/cache/photosync-restic
   service="/etc/systemd/system/photosync-restic-${id}-backup.service"
   timer="/etc/systemd/system/photosync-restic-${id}-backup.timer"
   maintenance_service="/etc/systemd/system/photosync-restic-${id}-maintenance.service"
   maintenance_timer="/etc/systemd/system/photosync-restic-${id}-maintenance.timer"
   {
     printf '[Unit]\nDescription=Restic backup to %s\nAfter=network-online.target\nWants=network-online.target\n' "$SERVER_LABEL"
-    printf '[Service]\nType=oneshot\nExecStart=%s restic-run %s\n' "$RESTIC_INSTALL_PATH" "$id"
+    printf 'StartLimitIntervalSec=6h\nStartLimitBurst=6\n'
+    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/var/cache/photosync-restic\n'
+    printf 'ExecStart=%s restic-run %s\nRestart=on-failure\nRestartSec=30m\n' "$RESTIC_INSTALL_PATH" "$id"
   } > "$service"
   {
     printf '[Unit]\nDescription=Daily Restic backup to %s\n' "$SERVER_LABEL"
@@ -1159,7 +1166,9 @@ write_controller_jobs() {
   } > "$timer"
   {
     printf '[Unit]\nDescription=Restic retention and integrity check for %s\nAfter=network-online.target\nWants=network-online.target\n' "$SERVER_LABEL"
-    printf '[Service]\nType=oneshot\nExecStart=%s restic-maintenance %s\n' "$RESTIC_INSTALL_PATH" "$id"
+    printf 'StartLimitIntervalSec=6h\nStartLimitBurst=6\n'
+    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/var/cache/photosync-restic\n'
+    printf 'ExecStart=%s restic-maintenance %s\nRestart=on-failure\nRestartSec=30m\n' "$RESTIC_INSTALL_PATH" "$id"
   } > "$maintenance_service"
   {
     printf '[Unit]\nDescription=Weekly Restic maintenance for %s\n' "$SERVER_LABEL"
