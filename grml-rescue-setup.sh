@@ -10,8 +10,13 @@ set -eu
 
 GRML_DIR="/boot/grml"
 GRML_DEFAULTS="/etc/default/grml-rescueboot"
-GRML_DOWNLOAD_URL="https://download.grml.org"
-GRML_SIGNING_KEY_URL="https://grml.org/download/gnupg-michael-prokop.txt"
+# Tried in order for release discovery, ISO downloads, and signatures.
+GRML_DOWNLOAD_MIRRORS="
+https://download.grml.org
+https://mirror.us.leaseweb.net/grml
+https://mirror.hugo-betrugo.de/grml
+"
+GRML_RELEASE="2026.04"
 GRML_SIGNING_FINGERPRINT="33CCB136401AFEC843A3876396A87872B7EA3737"
 GRML_GENERATOR_URL="https://raw.githubusercontent.com/grml/grml-rescueboot/v0.6.9/42_grml"
 GRML_GENERATOR_SHA256="38f83bf9e4200c157c5041f38ac51d9094ccbbe5fcdf542ec75b12812ce0748c"
@@ -199,6 +204,7 @@ install_rocky_grub_generator() {
   generator="/etc/grub.d/42_grml"
   generator_tmp="$(mktemp)"
   timestamp="$(date +%Y%m%d%H%M%S)"
+  backup_dir="/var/backups/grml-rescue-setup"
 
   info "Installing the Grml GRUB generator from pinned upstream release v0.6.9."
   if ! curl -fL --retry 3 -o "$generator_tmp" "$GRML_GENERATOR_URL"; then
@@ -208,9 +214,30 @@ install_rocky_grub_generator() {
   printf '%s  %s\n' "$GRML_GENERATOR_SHA256" "$generator_tmp" | sha256sum -c - >/dev/null \
     || die "The downloaded Grml GRUB generator failed checksum verification."
 
+  # Older versions of this setup script left executable backups in
+  # /etc/grub.d. GRUB executes every executable file there, which produced a
+  # duplicate menu entry for each backup. Keep any such files as data only.
+  for old_backup in /etc/grub.d/42_grml.bak.*; do
+    [ -e "$old_backup" ] || continue
+    chmod a-x "$old_backup"
+    info "Disabled obsolete GRUB generator backup $old_backup"
+  done
+
+  installed_checksum=""
   if [ -e "$generator" ]; then
-    cp -a "$generator" "$generator.bak.$timestamp"
-    info "Backed up $generator to $generator.bak.$timestamp"
+    installed_checksum="$(sha256sum "$generator" | awk '{ print $1 }')"
+  fi
+  if [ "$installed_checksum" = "$GRML_GENERATOR_SHA256" ]; then
+    rm -f "$generator_tmp"
+    info "The installed Grml GRUB generator is already current."
+    return 0
+  fi
+
+  if [ -e "$generator" ]; then
+    mkdir -p "$backup_dir"
+    cp -p "$generator" "$backup_dir/42_grml.$timestamp"
+    chmod 0644 "$backup_dir/42_grml.$timestamp"
+    info "Backed up $generator to $backup_dir/42_grml.$timestamp"
   fi
   install -m 0755 "$generator_tmp" "$generator"
   rm -f "$generator_tmp"
@@ -239,16 +266,41 @@ check_download_space() {
     || die "Not enough free space in $directory. Need about $((required_kb / 1024)) MiB; only $((available_kb / 1024)) MiB is available."
 }
 
-download_grml_small_rocky() {
-  info "Finding the latest grml-small release."
-  arch="$(grml_architecture)"
-  release="$(curl -fsSL "$GRML_DOWNLOAD_URL/" \
-    | sed -n "s/.*grml-small-\\([0-9][0-9][0-9][0-9]\\.[0-9][0-9]\\)-$arch\\.iso.*/\\1/p" \
-    | sort | tail -n 1)"
-  [ -n "$release" ] || die "Could not determine the latest grml-small release."
+download_from_grml_mirrors() {
+  relative_path="$1"
+  output_file="$2"
 
-  iso_name="grml-small-$release-$arch.iso"
-  iso_url="$GRML_DOWNLOAD_URL/$iso_name"
+  for mirror in $GRML_DOWNLOAD_MIRRORS; do
+    url="$mirror/$relative_path"
+    info "Trying $url"
+    if curl -fL --connect-timeout 15 --max-time 1800 --retry 2 \
+      -o "$output_file" "$url"; then
+      return 0
+    fi
+    warn "Download failed from $mirror; trying the next mirror."
+  done
+
+  return 1
+}
+
+disable_other_grml_small_isos() {
+  selected_iso="$1"
+  timestamp="$(date +%Y%m%d%H%M%S)"
+
+  for existing_iso in "$GRML_DIR"/grml-small-*.iso; do
+    [ -e "$existing_iso" ] || continue
+    [ "$existing_iso" = "$selected_iso" ] && continue
+    disabled_iso="$existing_iso.disabled.$timestamp"
+    mv "$existing_iso" "$disabled_iso"
+    info "Disabled non-selected Grml ISO: $existing_iso -> $disabled_iso"
+  done
+}
+
+download_grml_small_rocky() {
+  info "Using pinned grml-small release $GRML_RELEASE."
+  arch="$(grml_architecture)"
+  iso_name="grml-small-$GRML_RELEASE-$arch.iso"
+  iso_url="https://download.grml.org/$iso_name"
   iso_file="$GRML_DIR/$iso_name"
   iso_tmp="$iso_file.tmp"
   verify_dir="$(mktemp -d)"
@@ -266,16 +318,16 @@ download_grml_small_rocky() {
   else
     check_download_space "$GRML_DIR" "$iso_url"
     info "Downloading $iso_name to $GRML_DIR."
-    curl -fL --retry 3 -o "$iso_tmp" "$iso_url" \
-      || die "Failed to download $iso_url (partial file left at $iso_tmp)."
+    download_from_grml_mirrors "$iso_name" "$iso_tmp" \
+      || die "Failed to download $iso_name from every configured mirror (partial file left at $iso_tmp)."
     verify_file="$iso_tmp"
   fi
 
   info "Verifying the ISO signature and Grml signing-key fingerprint."
-  curl -fsSL -o "$verify_dir/signing-key.asc" "$GRML_SIGNING_KEY_URL" \
-    || die "Failed to download the Grml signing key."
-  curl -fsSL -o "$verify_dir/iso.asc" "$iso_url.asc" \
-    || die "Failed to download the ISO signature."
+  download_from_grml_mirrors "gnupg-michael-prokop.txt" "$verify_dir/signing-key.asc" \
+    || die "Failed to download the Grml signing key from every configured mirror."
+  download_from_grml_mirrors "$iso_name.asc" "$verify_dir/iso.asc" \
+    || die "Failed to download the ISO signature from every configured mirror."
   gpg --homedir "$gnupg_home" --batch --quiet --import-options import-minimal \
     --import "$verify_dir/signing-key.asc" >/dev/null 2>&1 \
     || die "Failed to import the Grml signing key."
@@ -290,6 +342,7 @@ download_grml_small_rocky() {
   if [ "$verify_file" = "$iso_tmp" ]; then
     mv "$iso_tmp" "$iso_file"
   fi
+  disable_other_grml_small_isos "$iso_file"
   rm -rf "$verify_dir"
   trap - 0 HUP INT TERM
   info "Verified $iso_file."
