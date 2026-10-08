@@ -206,7 +206,7 @@ ensure_config() {
 
     if [[ ! -f "$REPOS_FILE" ]]; then
         {
-            printf '# alias\trepo_path\n'
+            printf '# alias\trepo_path\tlocal_dir\n'
         } >"$REPOS_FILE"
     fi
 
@@ -420,15 +420,56 @@ load_account_menu() {
     done <"$ACCOUNTS_FILE"
 }
 
+terminal_columns() {
+    local columns="${COLUMNS:-}"
+
+    if [[ ! "$columns" =~ ^[0-9]+$ ]] && [[ -t 2 ]]; then
+        columns="$(tput cols 2>/dev/null || true)"
+    fi
+    [[ "$columns" =~ ^[0-9]+$ ]] || columns=100
+    (( columns < 60 )) && columns=60
+    printf '%s' "$columns"
+}
+
+print_account_table_row() {
+    local marker="$1" number="$2" alias="$3" auth_type="$4" server="$5" auth="$6"
+    local columns auth_width row=0
+    local alias_width=20 type_width=7 server_width=22
+    local alias_part type_part server_part auth_part
+
+    columns="$(terminal_columns)"
+    auth_width=$((columns - 60))
+    (( auth_width < 16 )) && auth_width=16
+
+    while (( row == 0 || ${#alias} > 0 || ${#auth_type} > 0 || ${#server} > 0 || ${#auth} > 0 )); do
+        alias_part="${alias:0:alias_width}"; alias="${alias:alias_width}"
+        type_part="${auth_type:0:type_width}"; auth_type="${auth_type:type_width}"
+        server_part="${server:0:server_width}"; server="${server:server_width}"
+        auth_part="${auth:0:auth_width}"; auth="${auth:auth_width}"
+        if (( row == 0 )); then
+            printf ' %1s %3s  %-20s %-7s %-22s %-*s\n' \
+                "$marker" "$number" "$alias_part" "$type_part" "$server_part" "$auth_width" "$auth_part"
+        else
+            printf ' %1s %3s  %-20s %-7s %-22s %-*s\n' \
+                '' '' "$alias_part" "$type_part" "$server_part" "$auth_width" "$auth_part"
+        fi
+        row=$((row + 1))
+    done
+}
+
+print_account_table_header() {
+    print_account_table_row '' 'NO.' 'ALIAS' 'TYPE' 'SERVER' 'AUTH'
+    printf '%*s\n' "$(terminal_columns)" '' | tr ' ' '-'
+}
+
 print_account_menu() {
     local i
 
     printf 'Saved accounts:\n' >&2
-    printf '  %-4s %-20s %-8s %-24s %s\n' "NO." "ALIAS" "TYPE" "SERVER" "AUTH" >&2
+    print_account_table_header >&2
 
     for i in "${!ACCOUNT_MENU_ALIASES[@]}"; do
-        printf '  %-4s %-20s %-8s %-24s %s\n' \
-            "$((i + 1))." \
+        print_account_table_row '' "$((i + 1))." \
             "${ACCOUNT_MENU_ALIASES[$i]}" \
             "${ACCOUNT_MENU_AUTH_TYPES[$i]}" \
             "${ACCOUNT_MENU_HOST_NAMES[$i]}" \
@@ -441,12 +482,11 @@ draw_account_arrow_menu() {
     local i marker
 
     printf 'Select account with Up/Down, then Enter:\n' >&2
+    print_account_table_header >&2
     for i in "${!ACCOUNT_MENU_ALIASES[@]}"; do
         marker=' '
         [[ "$i" -eq "$selected" ]] && marker='>'
-        printf ' %s %2s) %-20s %-8s %-24s %s\n' \
-            "$marker" \
-            "$((i + 1))" \
+        print_account_table_row "$marker" "$((i + 1))." \
             "${ACCOUNT_MENU_ALIASES[$i]}" \
             "${ACCOUNT_MENU_AUTH_TYPES[$i]}" \
             "${ACCOUNT_MENU_HOST_NAMES[$i]}" \
@@ -456,9 +496,8 @@ draw_account_arrow_menu() {
 
 select_account_arrow() {
     local selected=0
-    local key rest lines
+    local key rest
 
-    lines=$((${#ACCOUNT_MENU_ALIASES[@]} + 1))
     draw_account_arrow_menu "$selected"
 
     while IFS= read -rsn1 key; do
@@ -481,7 +520,7 @@ select_account_arrow() {
                         selected=$(((selected + 1) % ${#ACCOUNT_MENU_ALIASES[@]}))
                         ;;
                 esac
-                printf '\033[%sA\033[J' "$lines" >&2
+                clear_main_menu_screen
                 draw_account_arrow_menu "$selected"
                 ;;
         esac
@@ -517,8 +556,18 @@ select_account_numbered() {
 
 repo_path_from_input() {
     local input="$1"
-    local repo_path
+    local repo_path local_path origin_url
     local account_base_url="${ACCOUNT_BASE_URL:-}"
+
+    local_path="$(expand_path "$input")"
+    local_path="${local_path%/}"
+    if [[ -d "$local_path" ]] && is_git_repo_dir "$local_path"; then
+        if ! origin_url="$(git -C "$local_path" remote get-url origin 2>/dev/null)"; then
+            die "Local Git repo has no origin remote: $local_path"
+        fi
+        repo_path_from_input "$origin_url"
+        return
+    fi
 
     if [[ "${ACCOUNT_AUTH_TYPE:-}" == "https" && "$account_base_url" != "-" && "$input" == "${account_base_url%/}/"* ]]; then
         repo_path="${input#"${account_base_url%/}/"}"
@@ -533,7 +582,7 @@ repo_path_from_input() {
         return
     fi
 
-    if [[ "$input" =~ ^https://[^/]+/(.+)$ ]]; then
+    if [[ "$input" =~ ^https?://[^/]+/(.+)$ ]]; then
         repo_path="${BASH_REMATCH[1]}"
         repo_path="${repo_path%.git}"
         printf '%s' "$repo_path"
@@ -554,7 +603,7 @@ repo_path_from_input() {
         return
     fi
 
-    die "Repo must be a repo path, HTTPS URL, or SSH URL."
+    die "Repo must be an existing local Git repo, a namespace/repo path, an HTTP(S) URL, or an SSH URL."
 }
 
 load_repo_menu() {
@@ -1352,10 +1401,12 @@ configure_os_https_credentials() {
 save_repo() {
     local alias="$1"
     local repo_path="$2"
+    local local_dir="${3:--}"
     local tmp_file
 
     [[ -n "$repo_path" ]] || die "Repo path cannot be empty."
     validate_tsv_value "Repo path" "$repo_path"
+    validate_tsv_value "Local directory" "$local_dir"
 
     tmp_file="$(mktemp)"
     awk -F '\t' -v alias="$alias" -v repo_path="$repo_path" '
@@ -1363,9 +1414,114 @@ save_repo() {
         /^#/ || NF == 0 { print; next }
         !($1 == alias && $2 == repo_path) { print }
     ' "$REPOS_FILE" >"$tmp_file"
-    printf '%s\t%s\n' "$alias" "$repo_path" >>"$tmp_file"
+    printf '%s\t%s\t%s\n' "$alias" "$repo_path" "$local_dir" >>"$tmp_file"
     mv "$tmp_file" "$REPOS_FILE"
     chmod 600 "$REPOS_FILE" 2>/dev/null || true
+}
+
+delete_repo_record() {
+    local alias="$1"
+    local repo_path="$2"
+    local tmp_file
+
+    tmp_file="$(mktemp)"
+    awk -F '\t' -v alias="$alias" -v repo_path="$repo_path" '
+        BEGIN { OFS = FS }
+        /^#/ || NF == 0 { print; next }
+        !($1 == alias && $2 == repo_path) { print }
+    ' "$REPOS_FILE" >"$tmp_file"
+    mv "$tmp_file" "$REPOS_FILE"
+    chmod 600 "$REPOS_FILE" 2>/dev/null || true
+}
+
+repo_count() {
+    awk -F '\t' 'NF && $1 !~ /^#/ { count++ } END { print count + 0 }' "$REPOS_FILE"
+}
+
+load_registered_repos() {
+    local alias repo_path local_dir
+
+    REGISTERED_REPO_ALIASES=()
+    REGISTERED_REPO_PATHS=()
+    REGISTERED_REPO_DIRS=()
+    while IFS=$'\t' read -r alias repo_path local_dir; do
+        [[ -n "${alias:-}" && "$alias" != \#* && -n "${repo_path:-}" ]] || continue
+        REGISTERED_REPO_ALIASES+=("$alias")
+        REGISTERED_REPO_PATHS+=("$repo_path")
+        REGISTERED_REPO_DIRS+=("${local_dir:--}")
+    done <"$REPOS_FILE"
+}
+
+select_registered_repo_numbered() {
+    local selected i count="${#REGISTERED_REPO_PATHS[@]}"
+
+    printf 'Configured repositories:\n' >&2
+    for i in "${!REGISTERED_REPO_PATHS[@]}"; do
+        printf '  %s. %-24s %-36s %s\n' "$((i + 1))" \
+            "${REGISTERED_REPO_ALIASES[$i]}" "${REGISTERED_REPO_PATHS[$i]}" \
+            "${REGISTERED_REPO_DIRS[$i]}" >&2
+    done
+    printf '  %s. Back\n' "$((count + 1))" >&2
+    while true; do
+        selected="$(prompt_required "Select repository number")"
+        if [[ "$selected" == "$((count + 1))" || "${selected,,}" == "back" ]]; then
+            printf '%s' '-1'
+            return
+        fi
+        if [[ "$selected" =~ ^[0-9]+$ ]] && (( selected >= 1 && selected <= count )); then
+            printf '%s' "$((selected - 1))"
+            return
+        fi
+        info "Choose a number from 1 to $count." >&2
+    done
+}
+
+select_registered_repo_arrow() {
+    local selected=0 key rest lines i marker item_count
+
+    item_count=$((${#REGISTERED_REPO_PATHS[@]} + 1))
+    lines=$((item_count + 1))
+    while true; do
+        printf 'Select configured repository with Up/Down, then Enter:\n' >&2
+        for i in "${!REGISTERED_REPO_PATHS[@]}"; do
+            marker=' '; [[ "$i" -eq "$selected" ]] && marker='>'
+            printf ' %s %2s) %-24s %-36s %s\n' "$marker" "$((i + 1))" \
+                "${REGISTERED_REPO_ALIASES[$i]}" "${REGISTERED_REPO_PATHS[$i]}" \
+                "${REGISTERED_REPO_DIRS[$i]}" >&2
+        done
+        marker=' '
+        [[ "$selected" -eq "${#REGISTERED_REPO_PATHS[@]}" ]] && marker='>'
+        printf ' %s %2s) Back\n' "$marker" "$item_count" >&2
+        IFS= read -rsn1 key
+        case "$key" in
+            '')
+                if [[ "$selected" -eq "${#REGISTERED_REPO_PATHS[@]}" ]]; then
+                    printf '%s\n' '-1'
+                else
+                    printf '%s\n' "$selected"
+                fi
+                return
+                ;;
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 rest || rest=''
+                case "$rest" in
+                    '[A') selected=$(((selected - 1 + item_count) % item_count)) ;;
+                    '[B') selected=$(((selected + 1) % item_count)) ;;
+                esac
+                printf '\033[%sA\033[J' "$lines" >&2
+                ;;
+        esac
+    done
+}
+
+select_registered_repo() {
+    load_registered_repos
+    (( ${#REGISTERED_REPO_PATHS[@]} > 0 )) || die "No configured repositories found."
+    if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
+        select_registered_repo_arrow
+    else
+        select_registered_repo_numbered
+    fi
 }
 
 delete_account_repos() {
@@ -1538,9 +1694,9 @@ list_accounts() {
     fi
 
     load_account_menu
-    printf '%-20s %-8s %-24s %s\n' "ALIAS" "TYPE" "SERVER" "AUTH"
+    print_account_table_header
     for i in "${!ACCOUNT_MENU_ALIASES[@]}"; do
-        printf '%-20s %-8s %-24s %s\n' \
+        print_account_table_row '' "$((i + 1))." \
             "${ACCOUNT_MENU_ALIASES[$i]}" \
             "${ACCOUNT_MENU_AUTH_TYPES[$i]}" \
             "${ACCOUNT_MENU_HOST_NAMES[$i]}" \
@@ -1721,15 +1877,38 @@ add_account() {
     fi
 }
 
+update_account() {
+    local alias selected back_number
+
+    ensure_config
+    [[ "$(account_count)" != "0" ]] || die "No accounts found."
+    load_account_menu
+    back_number=$((${#ACCOUNT_MENU_ALIASES[@]} + 1))
+    if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
+        ACCOUNT_MENU_ALIASES+=("__back__")
+        ACCOUNT_MENU_AUTH_TYPES+=("")
+        ACCOUNT_MENU_HOST_NAMES+=("")
+        ACCOUNT_MENU_AUTH_DETAILS+=("Back")
+        alias="$(select_account_arrow)"
+        [[ "$alias" != "__back__" ]] || return
+    else
+        print_account_menu
+        printf '  %s. Back\n' "$back_number" >&2
+        selected="$(prompt_required "Select account number, or Back")"
+        [[ "$selected" == "$back_number" || "${selected,,}" == "back" ]] && return
+        [[ "$selected" =~ ^[0-9]+$ ]] || die "Choose an account number or Back."
+        (( selected >= 1 && selected < back_number )) || die "Choose a number from 1 to $back_number."
+        alias="${ACCOUNT_MENU_ALIASES[$((selected - 1))]}"
+    fi
+    add_account "$alias"
+}
+
 delete_account() {
     local alias="${1:-}"
 
     ensure_config
 
-    if [[ -z "$alias" ]]; then
-        list_accounts
-        alias="$(prompt_required "Account alias to delete")"
-    fi
+    [[ -n "$alias" ]] || alias="$(choose_account_alias)"
 
     validate_alias "$alias"
     load_account "$alias" || die "Unknown account alias: $alias"
@@ -1865,7 +2044,6 @@ add_repo() {
         repo_path="$(repo_path_from_input "$repo_input")"
     fi
 
-    save_repo "$selected_alias" "$repo_path"
     remote_url="$(normalize_repo_remote "$repo_path")"
 
     if ! is_git_repo && directory_has_data "."; then
@@ -1876,10 +2054,12 @@ add_repo() {
     case "$mode" in
         current)
             configure_repo_directory "." "$remote_url"
+            target_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
             ;;
         path)
             target_dir="$(prompt_default "Repo directory" ".")"
             configure_repo_directory "$target_dir" "$remote_url"
+            target_dir="$(git -C "$target_dir" rev-parse --show-toplevel)"
             ;;
         clone)
             repo_name="$(repo_name_from_path "$repo_path")"
@@ -1894,49 +2074,79 @@ add_repo() {
                 git clone "$remote_url" "$destination"
             fi
             configure_repo_identity "$destination" "$remote_url"
+            target_dir="$(git -C "$destination" rev-parse --show-toplevel)"
             ;;
         *)
             die "Expected current, path, or clone."
             ;;
     esac
+    save_repo "$selected_alias" "$repo_path" "$target_dir"
 }
 
-delete_repo() {
-    ensure_git_available
-    is_git_repo || die "Current directory is not inside a Git repo."
+remove_repo() {
+    local selected alias repo_path repo_dir
 
-    if git remote get-url origin >/dev/null 2>&1; then
-        info "Current origin: $(git remote get-url origin)"
-        if confirm "Remove origin from this repo?" "no"; then
-            git remote remove origin
-            info "Removed origin."
+    ensure_config
+    selected="$(select_registered_repo)"
+    [[ "$selected" != "-1" ]] || return
+    alias="${REGISTERED_REPO_ALIASES[$selected]}"
+    repo_path="${REGISTERED_REPO_PATHS[$selected]}"
+    repo_dir="${REGISTERED_REPO_DIRS[$selected]}"
+
+    confirm "Remove '$repo_path' from the configured repository list?" "no" || return
+    delete_repo_record "$alias" "$repo_path"
+    info "Removed '$repo_path' from the configured repository list."
+
+    [[ "$repo_dir" != "-" && -d "$repo_dir" ]] || return
+    confirm "Also remove origin and local identity from $repo_dir?" "no" || return
+    git -C "$repo_dir" remote remove origin 2>/dev/null || true
+    git -C "$repo_dir" config --unset user.name 2>/dev/null || true
+    git -C "$repo_dir" config --unset user.email 2>/dev/null || true
+    info "Removed origin and local identity from $repo_dir."
+}
+
+list_repos() {
+    local alias repo_path repo_dir status origin
+
+    ensure_config
+    if [[ "$(repo_count)" == "0" ]]; then
+        info "No configured repositories found."
+        return
+    fi
+    printf 'Configured repositories:\n'
+    while IFS=$'\t' read -r alias repo_path repo_dir; do
+        [[ -n "${alias:-}" && "$alias" != \#* ]] || continue
+        repo_dir="${repo_dir:--}"
+        status='registered'
+        if [[ "$repo_dir" != "-" && -d "$repo_dir" ]] && is_git_repo_dir "$repo_dir"; then
+            status='configured'
+            origin="$(git -C "$repo_dir" remote get-url origin 2>/dev/null || true)"
+            [[ -n "$origin" ]] || status='no-origin'
+        elif [[ "$repo_dir" != "-" ]]; then
+            status='missing'
         fi
-    else
-        info "This repo has no origin remote."
-    fi
-
-    if confirm "Unset local user.name and user.email for this repo?" "no"; then
-        git config --unset user.name 2>/dev/null || true
-        git config --unset user.email 2>/dev/null || true
-        info "Unset local Git identity."
-    fi
+        printf '\n  Account:    %s\n' "$alias"
+        printf '  Repository: %s\n' "$repo_path"
+        printf '  Status:     %s\n' "$status"
+        printf '  Local dir:  %s\n' "$repo_dir"
+    done <"$REPOS_FILE"
 }
 
-list_repo() {
+update_repo() {
+    local selected alias repo_path repo_dir remote_url
+
+    ensure_config
     ensure_git_available
-    is_git_repo || die "Current directory is not inside a Git repo."
-
-    info "Repo: $(git rev-parse --show-toplevel)"
-    info "Branch: $(git branch --show-current 2>/dev/null || true)"
-
-    if git remote get-url origin >/dev/null 2>&1; then
-        info "Origin: $(git remote get-url origin)"
-    else
-        info "Origin: not set"
-    fi
-
-    info "user.name:  $(git config user.name 2>/dev/null || true)"
-    info "user.email: $(git config user.email 2>/dev/null || true)"
+    selected="$(select_registered_repo)"
+    [[ "$selected" != "-1" ]] || return
+    alias="${REGISTERED_REPO_ALIASES[$selected]}"
+    repo_path="${REGISTERED_REPO_PATHS[$selected]}"
+    repo_dir="${REGISTERED_REPO_DIRS[$selected]}"
+    [[ "$repo_dir" != "-" && -d "$repo_dir" ]] || die "Local repository directory is unavailable: $repo_dir"
+    load_account "$alias" || die "Account '$alias' no longer exists."
+    remote_url="$(normalize_repo_remote "$repo_path")"
+    configure_repo_identity "$repo_dir" "$remote_url"
+    save_repo "$alias" "$repo_path" "$(git -C "$repo_dir" rev-parse --show-toplevel)"
 }
 
 clear_main_menu_screen() {
@@ -1948,12 +2158,8 @@ clear_main_menu_screen() {
 draw_main_menu() {
     local selected="$1"
     local actions=(
-        "Add account"
-        "Delete account"
-        "List accounts and SSH public keys"
-        "Add or configure repository"
-        "Remove current repository configuration"
-        "Show current repository"
+        "Manage Git accounts"
+        "Manage repositories"
         "Help and storage details"
         "Quit"
     )
@@ -1972,12 +2178,8 @@ draw_main_menu() {
 
 select_main_menu_arrow() {
     local action_names=(
-        "add_account"
-        "delete_account"
-        "list_accounts"
-        "add_repo"
-        "delete_repo"
-        "list_repo"
+        "manage_accounts"
+        "manage_repositories"
         "help"
         "quit"
     )
@@ -2017,14 +2219,10 @@ select_main_menu_arrow() {
 print_main_menu_numbered() {
     printf 'multi_git main menu\n' >&2
     printf 'Working directory: %s\n\n' "$PWD" >&2
-    printf '  1. Add account\n' >&2
-    printf '  2. Delete account\n' >&2
-    printf '  3. List accounts and SSH public keys\n' >&2
-    printf '  4. Add or configure repository\n' >&2
-    printf '  5. Remove current repository configuration\n' >&2
-    printf '  6. Show current repository\n' >&2
-    printf '  7. Help and storage details\n' >&2
-    printf '  8. Quit\n' >&2
+    printf '  1. Manage Git accounts\n' >&2
+    printf '  2. Manage repositories\n' >&2
+    printf '  3. Help and storage details\n' >&2
+    printf '  4. Quit\n' >&2
 }
 
 select_main_menu_numbered() {
@@ -2034,15 +2232,11 @@ select_main_menu_numbered() {
     while true; do
         selected="$(prompt_required "Select menu number")"
         case "$selected" in
-            1) printf '%s' 'add_account'; return ;;
-            2) printf '%s' 'delete_account'; return ;;
-            3) printf '%s' 'list_accounts'; return ;;
-            4) printf '%s' 'add_repo'; return ;;
-            5) printf '%s' 'delete_repo'; return ;;
-            6) printf '%s' 'list_repo'; return ;;
-            7) printf '%s' 'help'; return ;;
-            8|q|quit|exit) printf '%s' 'quit'; return ;;
-            *) info "Choose a number from 1 to 8." >&2 ;;
+            1) printf '%s' 'manage_accounts'; return ;;
+            2) printf '%s' 'manage_repositories'; return ;;
+            3) printf '%s' 'help'; return ;;
+            4|q|quit|exit) printf '%s' 'quit'; return ;;
+            *) info "Choose a number from 1 to 4." >&2 ;;
         esac
     done
 }
@@ -2056,20 +2250,94 @@ choose_main_menu_action() {
 }
 
 pause_main_menu() {
-    printf '\nPress Enter to return to the main menu...' >&2
+    printf '\nPress Enter to continue...' >&2
     IFS= read -r _menu_pause || true
+}
+
+select_management_arrow() {
+    local title="$1"; shift
+    local labels=("$@") selected=0 key rest lines i marker
+
+    lines=$((${#labels[@]} + 1))
+    while true; do
+        printf '%s — use Up/Down, then Enter:\n' "$title" >&2
+        for i in "${!labels[@]}"; do
+            marker=' '; [[ "$i" -eq "$selected" ]] && marker='>'
+            printf ' %s %2s) %s\n' "$marker" "$((i + 1))" "${labels[$i]}" >&2
+        done
+        IFS= read -rsn1 key
+        case "$key" in
+            '') printf '%s\n' "$((selected + 1))"; return ;;
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 rest || rest=''
+                case "$rest" in
+                    '[A') selected=$(((selected - 1 + ${#labels[@]}) % ${#labels[@]})) ;;
+                    '[B') selected=$(((selected + 1) % ${#labels[@]})) ;;
+                esac
+                printf '\033[%sA\033[J' "$lines" >&2
+                ;;
+        esac
+    done
+}
+
+select_account_management_arrow() {
+    select_management_arrow "Manage Git accounts" "Add account" \
+        "List accounts and SSH public keys" "Update account" "Delete account" "Back"
+}
+
+select_repository_management_arrow() {
+    select_management_arrow "Manage repositories" "Add repository" \
+        "List configured repositories" "Update repository" "Remove repository" "Back"
+}
+
+manage_accounts_menu() {
+    local selected
+
+    while true; do
+        if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
+            selected="$(select_account_management_arrow)"
+        else
+            printf 'Manage Git accounts:\n  1. Add account\n  2. List accounts and SSH public keys\n  3. Update account\n  4. Delete account\n  5. Back\n' >&2
+            selected="$(prompt_required "Select account action")"
+        fi
+        case "$selected" in
+            1) add_account; pause_main_menu ;;
+            2) list_accounts; pause_main_menu ;;
+            3) update_account; pause_main_menu ;;
+            4) delete_account; pause_main_menu ;;
+            5|b|back) return ;;
+            *) info "Choose a number from 1 to 5." >&2 ;;
+        esac
+    done
+}
+
+manage_repositories_menu() {
+    local selected
+
+    while true; do
+        if [[ -t 0 && "${TERM:-dumb}" != "dumb" ]]; then
+            selected="$(select_repository_management_arrow)"
+        else
+            printf 'Manage repositories:\n  1. Add repository\n  2. List configured repositories\n  3. Update repository\n  4. Remove repository\n  5. Back\n' >&2
+            selected="$(prompt_required "Select repository action")"
+        fi
+        case "$selected" in
+            1) add_repo; pause_main_menu ;;
+            2) list_repos; pause_main_menu ;;
+            3) update_repo; pause_main_menu ;;
+            4) remove_repo; pause_main_menu ;;
+            5|b|back) return ;;
+            *) info "Choose a number from 1 to 5." >&2 ;;
+        esac
+    done
 }
 
 run_main_menu_action() {
     local action="$1"
 
     case "$action" in
-        add_account) add_account ;;
-        delete_account) delete_account ;;
-        list_accounts) list_accounts ;;
-        add_repo) add_repo ;;
-        delete_repo) delete_repo ;;
-        list_repo) list_repo ;;
+        manage_accounts) manage_accounts_menu ;;
+        manage_repositories) manage_repositories_menu ;;
         help) usage ;;
         *) die "Unknown menu action: $action" ;;
     esac
@@ -2091,7 +2359,7 @@ interactive_main_menu() {
         if ! (run_main_menu_action "$action"); then
             info "Action failed. Review the message above, then return to the menu." >&2
         fi
-        pause_main_menu
+        [[ "$action" == "help" ]] && pause_main_menu
     done
 }
 
@@ -2119,10 +2387,13 @@ main() {
             add_repo "${3:-}" "${4:-}"
             ;;
         del:repo|del:repository|delete:repo|delete:repository|remove:repo|remove:repository)
-            delete_repo
+            remove_repo
             ;;
         list:repo|list:repository|ls:repo|ls:repository)
-            list_repo
+            list_repos
+            ;;
+        update:repo|update:repository)
+            update_repo
             ;;
         *)
             usage
