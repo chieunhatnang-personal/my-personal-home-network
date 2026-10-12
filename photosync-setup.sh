@@ -9,10 +9,15 @@ SCRIPT_NAME=${0##*/}
 FSTAB=/etc/fstab
 SMB_CONF=/etc/samba/smb.conf
 SMB_MANAGED_CONF=/etc/samba/photosync-setup.conf
-RESTIC_CONTROLLER_DIR=/etc/photosync-restic-controller
+HOME_PHOTOS_DIR=/etc/homephotos
+RESTIC_CONTROLLER_DIR=$HOME_PHOTOS_DIR/restic
 RESTIC_SERVERS_DIR=$RESTIC_CONTROLLER_DIR/servers
-RESTIC_ARCHIVE_DIR=/var/backups/photosync-restic-controller
-RESTIC_CONTROLLER_KEY=/root/.ssh/photosync-restic-controller-ed25519
+RESTIC_STORAGES_DIR=$RESTIC_CONTROLLER_DIR/storages
+RESTIC_REPOSITORIES_DIR=$RESTIC_CONTROLLER_DIR/repositories
+RESTIC_JOBS_DIR=$RESTIC_CONTROLLER_DIR/jobs
+RESTIC_LOCKS_DIR=$RESTIC_CONTROLLER_DIR/locks
+RESTIC_ARCHIVE_DIR=$HOME_PHOTOS_DIR/archives/restic
+RESTIC_CONTROLLER_KEY=$HOME_PHOTOS_DIR/keys/restic-ed25519
 RESTIC_INSTALL_PATH=/usr/local/sbin/photosync-setup
 
 MOUNT_OPTIONS='defaults,nofail,x-systemd.device-timeout=10s,x-systemd.mount-timeout=30s'
@@ -71,16 +76,18 @@ choose_menu() {
   local title=$1
   shift
   local options=("$@") selected=0 key sequence i marker
+  local cyan='' green='' reset=''
+  if [[ -z ${NO_COLOR:-} ]]; then cyan=$'\033[1;36m'; green=$'\033[1;32m'; reset=$'\033[0m'; fi
   [ "${#options[@]}" -gt 0 ] || die "Internal error: menu has no choices."
 
   while :; do
     printf '\033[2J\033[H'
-    printf '%s\n\n' "$title"
+    printf '%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n  %s\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$cyan" "$title" "$reset"
     printf 'Use Up/Down arrows, then Enter.\n\n'
     for i in "${!options[@]}"; do
       marker=' '
       [ "$i" -eq "$selected" ] && marker='>'
-      printf ' %s %s\n' "$marker" "${options[$i]}"
+      if [[ $i == "$selected" ]]; then printf '%s %s %s%s\n' "$green" "$marker" "${options[$i]}" "$reset"; else printf '   %s\n' "${options[$i]}"; fi
     done
 
     IFS= read -rsn1 key
@@ -248,8 +255,28 @@ confirm_format() {
   [ "$answer" = "$disk" ] || die "Format cancelled."
 }
 
+hp_format_guard() {
+  local disk=$1 root ancestors item mounts types
+  root=$(findmnt -rn -o SOURCE /) || die 'Cannot identify system filesystem; formatting refused.'
+  [[ $root == /dev/* ]] || die 'Unsupported root layout; format manually after review.'
+  ancestors=$(lsblk -s -nrpo NAME "$root") || die 'Cannot identify all root backing devices.'
+  [[ -n $ancestors ]] || die 'Unknown root ancestry.'
+  while IFS= read -r item; do
+    [[ $item != "$disk" ]] || die 'Refusing to format a system backing device.'
+  done <<< "$ancestors"
+  types=$(lsblk -dnro TYPE "$disk") || die 'Cannot inspect formatting target.'
+  [[ $types == disk ]] || die 'Formatting requires a whole, standalone disk.'
+  types=$(lsblk -nr -o TYPE "$disk") || die 'Cannot inspect disk children.'
+  while IFS= read -r item; do
+    case $item in disk|part) ;; *) die 'Disk has layered holders; formatting refused.';; esac
+  done <<< "$types"
+  mounts=$(lsblk -nr -o MOUNTPOINT "$disk") || die 'Cannot inspect mount use.'
+  [[ -z ${mounts//[[:space:]]/} ]] || die 'Disk or partition is mounted/in use; formatting refused.'
+}
+
 format_ext4_disk() {
   local disk=$1 label=$2
+  hp_format_guard "$disk"
   install_packages parted e2fsprogs
   confirm_format "$disk"
   note "Creating a GPT partition table and an ext4 filesystem on $disk"
@@ -268,21 +295,22 @@ format_ext4_disk() {
 
 mount_filesystem() {
   local device=$1 mountpoint=$2 uuid fstype entry
-  [[ $mountpoint = /* && $mountpoint != / ]] || die "Mount point must be an absolute path other than /."
+  hp_safe_path "$mountpoint" || die "Use a safe absolute mount path."
+  [[ $(realpath -m -- "$mountpoint") == "$mountpoint" ]] || die "Mount path must not contain symlinks."
   uuid=$(blkid -s UUID -o value "$device")
   fstype=$(blkid -s TYPE -o value "$device")
   [ -n "$uuid" ] && [ -n "$fstype" ] || die "Could not read filesystem UUID/type from $device."
   [ "$fstype" = ext4 ] || die "This script currently mounts only ext4 filesystems for server storage."
 
-  if findmnt -rn --target "$mountpoint" >/dev/null; then
+  if findmnt -rn --mountpoint "$mountpoint" >/dev/null; then
     local current_source
-    current_source=$(findmnt -nr -o SOURCE --target "$mountpoint")
+    current_source=$(findmnt -nr -o SOURCE --mountpoint "$mountpoint")
     [ "$current_source" = "$device" ] || die "$mountpoint is already mounted from $current_source."
     MOUNTPOINT=$mountpoint
     return 0
   fi
 
-  if grep -Eq "^[[:space:]]*UUID=[^[:space:]]+[[:space:]]+$mountpoint[[:space:]]" "$FSTAB"; then
+  if grep -Eq "^[[:space:]]*UUID=[^[:space:]]+[[:space:]]+${mountpoint}[[:space:]]" "$FSTAB"; then
     die "$mountpoint already has an /etc/fstab entry. Review it before continuing."
   fi
 
@@ -294,7 +322,7 @@ mount_filesystem() {
   printf '%s\n' "$entry" >> "$FSTAB"
   systemctl daemon-reload
   mount "$mountpoint"
-  findmnt -rn --target "$mountpoint" >/dev/null || die "Failed to mount $mountpoint."
+  findmnt -rn --mountpoint "$mountpoint" >/dev/null || die "Failed to mount $mountpoint."
   MOUNTPOINT=$mountpoint
 }
 
@@ -790,22 +818,37 @@ view_backup_server_info() {
 
 ensure_restic_controller() {
   install_packages restic openssh-client sshpass
-  command_exists systemd-creds || die 'systemd-creds is required to encrypt stored administrator and repository passwords.'
-  install -d -m 0700 -o root -g root "$RESTIC_CONTROLLER_DIR" "$RESTIC_SERVERS_DIR" "$RESTIC_ARCHIVE_DIR" /root/.ssh
+  hp_init
+  command_exists systemd-creds || note "Debian credential fallback: root-only 0600 secrets, NOT encrypted at rest. Use full-disk encryption."
+  install -d -m 0700 -o root -g root "$RESTIC_CONTROLLER_DIR" "$RESTIC_SERVERS_DIR" "$RESTIC_ARCHIVE_DIR" "$HOME_PHOTOS_DIR/keys"
   if [ ! -f "$RESTIC_CONTROLLER_KEY" ]; then
     ssh-keygen -q -t ed25519 -N '' -f "$RESTIC_CONTROLLER_KEY"
     note "Created controller SSH key: ${RESTIC_CONTROLLER_KEY}.pub"
   fi
-  install -m 0700 -o root -g root "$(readlink -f "$0")" "$RESTIC_INSTALL_PATH"
+  hp_install_self
 }
 
 controller_server_dir() {
   valid_name "$1" || die "Invalid Restic server id: $1"
-  printf '%s/%s\n' "$RESTIC_SERVERS_DIR" "$1"
+  local legacy=${HP_LEGACY_RESTIC_DIR:-/etc/photosync-restic-controller}
+  if [[ ! -f $RESTIC_SERVERS_DIR/$1/server.conf && -f $legacy/servers/$1/server.conf ]]; then
+    printf '%s/servers/%s\n' "$legacy" "$1"
+  else
+    printf '%s/%s\n' "$RESTIC_SERVERS_DIR" "$1"
+  fi
 }
 
 encrypt_controller_secret() {
   local output=$1 credential_name=$2 secret=$3 temp
+  hp_init
+  if ! command_exists systemd-creds; then
+    # Debian 11: explicitly marked root-only file, never pretend it is encrypted.
+    temp=$(mktemp "$HOME_PHOTOS_DIR/tmp/credential.XXXXXX")
+    printf 'HOMEPHOTOS-PRIVATE-V1\n%s' "$secret" > "$temp"
+    chmod 0600 "$temp"
+    mv -- "$temp" "$output"
+    return
+  fi
   temp=$(mktemp)
   chmod 0600 "$temp"
   printf '%s' "$secret" > "$temp"
@@ -820,7 +863,14 @@ encrypt_controller_secret() {
 decrypt_controller_secret() {
   local path=$1
   [ -f "$path" ] || die "Encrypted credential is missing: $path"
-  systemd-creds decrypt "$path" - 2>/dev/null
+  local header
+  IFS= read -r header < "$path" || true
+  if [[ $header == HOMEPHOTOS-PRIVATE-V1 ]]; then
+    tail -n +2 -- "$path"
+  else
+    command_exists systemd-creds || die 'Legacy encrypted credential needs systemd-creds on its original host. Export/re-enter it there; no automatic decryption migration.'
+    systemd-creds decrypt "$path" - 2>/dev/null
+  fi
 }
 
 valid_host() {
@@ -874,7 +924,7 @@ ask_nonnegative_integer() {
 parse_source_paths() {
   local input=$1 item
   SOURCE_PATHS=()
-  while IFS= read -r item; do
+  while IFS= read -r item || [ -n "$item" ]; do
     item=$(printf '%s' "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [ -n "$item" ] || continue
     valid_absolute_path "$item" || die "Backup source must be an absolute path: $item"
@@ -924,7 +974,6 @@ load_controller_server() {
   local dir
   dir=$(controller_server_dir "$1")
   [ -f "$dir/server.conf" ] || die "Restic backup server is not configured: $1"
-  SOURCE_PATHS=()
   # Root-owned controller profiles are executable shell assignments so arrays
   # and paths containing spaces remain lossless.
   # shellcheck disable=SC1090
@@ -933,11 +982,10 @@ load_controller_server() {
 
 controller_server_ids() {
   local config
-  [ -d "$RESTIC_SERVERS_DIR" ] || return 0
-  for config in "$RESTIC_SERVERS_DIR"/*/server.conf; do
+  for config in "$RESTIC_SERVERS_DIR"/*/server.conf "${HP_LEGACY_RESTIC_DIR:-/etc/photosync-restic-controller}"/servers/*/server.conf; do
     [ -f "$config" ] || continue
     basename "$(dirname "$config")"
-  done | sort
+  done | sort -u
 }
 
 pin_controller_host_key() {
@@ -1033,7 +1081,11 @@ remote_controller_exec() {
   target="${ADMIN_USER}@${BACKUP_HOST}"
   set +e
   SSHPASS="$admin_password" sshpass -e ssh -n \
-    -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" \
+    -o BatchMode=no -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+    -o KbdInteractiveAuthentication=no -o NumberOfPasswordPrompts=1 \
+    -o ConnectionAttempts=1 -o ConnectTimeout=10 \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" \
     "$target" "printf '%s' '$encoded' | base64 -d | bash"
   status=$?
   set -e
@@ -1042,11 +1094,19 @@ remote_controller_exec() {
 }
 
 provision_controller_server() {
-  local id=$1 public_key_b64 remote_script
-  load_controller_server "$id"
+  local id=$1 public_key_b64 remote_script endpoint_id=$1 remote_server_id=$1
+  if [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
+    load_controller_repository "$id"; endpoint_id=$REPOSITORY_ID
+    load_controller_storage "$REPOSITORY_STORAGE_ID"
+    [[ $STORAGE_SERVER_ID == "$REPOSITORY_SERVER_ID" ]] || die 'Repository server and storage server do not match.'
+    remote_server_id=$REPOSITORY_SERVER_ID
+    load_controller_server "$remote_server_id"
+  else
+    load_controller_server "$id"
+  fi
   public_key_b64=$(base64 -w 0 "${RESTIC_CONTROLLER_KEY}.pub")
   remote_script=$(printf 'SERVER_ID=%q\nSFTP_USER=%q\nMOUNTPOINT=%q\nREPOSITORY=%q\nPUBLIC_KEY_B64=%q\n' \
-    "$SERVER_ID" "$SFTP_USER" "$REMOTE_MOUNTPOINT" "$REPOSITORY" "$public_key_b64")
+    "$endpoint_id" "$SFTP_USER" "$REMOTE_MOUNTPOINT" "$REPOSITORY" "$public_key_b64")
   remote_script+=$'\n'
   remote_script+=$(cat <<'REMOTE_SCRIPT'
 set -Eeuo pipefail
@@ -1097,31 +1157,51 @@ printf 'Remote Restic endpoint ready: %s/%s (SFTP user %s)\n' "$MOUNTPOINT" "$RE
 REMOTE_SCRIPT
 )
   note "Provisioning Restic endpoint on $BACKUP_HOST"
-  remote_controller_exec "$id" "$remote_script" || die "Remote provisioning failed for $id."
+  remote_controller_exec "$remote_server_id" "$remote_script" || die "Remote provisioning failed for $id."
 }
 
 restic_controller_command() {
-  local id=$1 action=$2 dir repository_url password_command sftp_command
+  local id=$1 action=$2 dir repository_url password_command sftp_command credential_id=$1 lock_fd lock_path
   shift 2
-  load_controller_server "$id"
-  dir=$(controller_server_dir "$id")
+  if [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]]; then
+    hp_resolve_job "$id"
+    credential_id=$JOB_REPOSITORY_ID
+  elif [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
+    hp_resolve_repository "$id"
+  else
+    load_controller_server "$id"
+  fi
+  if [[ $action == backup ]]; then
+    hp_restic_init
+    lock_path="$RESTIC_LOCKS_DIR/repository-${credential_id}.lock"
+    exec {lock_fd}>"$lock_path"
+    flock -n "$lock_fd" || die "Another backup is already running for repository '$credential_id'."
+  fi
+  hp_install_self
+  dir=$(controller_server_dir "$SERVER_ID")
   repository_url="sftp:${SFTP_USER}@${BACKUP_HOST}:/${REPOSITORY}"
-  password_command="systemd-creds decrypt '$dir/repository-password.cred' -"
+  password_command="$RESTIC_INSTALL_PATH restic-secret $credential_id"
+  local ssh_key=$RESTIC_CONTROLLER_KEY
+  [[ $dir != "${HP_LEGACY_RESTIC_DIR:-/etc/photosync-restic-controller}/"* ]] || ssh_key=/root/.ssh/photosync-restic-controller-ed25519
+  export RESTIC_CACHE_DIR="$HOME_PHOTOS_DIR/cache/restic"
   # Restic tokenizes sftp.command itself. Attach each -o value so an option
   # cannot be separated from its argument by that tokenizer.
-  sftp_command="ssh -i $RESTIC_CONTROLLER_KEY -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes -oUserKnownHostsFile=$dir/known_hosts ${SFTP_USER}@${BACKUP_HOST} -s sftp"
+  sftp_command="ssh -i $ssh_key -oBatchMode=yes -oConnectTimeout=15 -oStrictHostKeyChecking=yes -oUserKnownHostsFile=$dir/known_hosts ${SFTP_USER}@${BACKUP_HOST} -s sftp"
   case "$action" in
     init)
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" cat config >/dev/null 2>&1 || \
         restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" init
       ;;
     backup)
+      hp_restic_source_guard
+      local compression_args=()
+      if restic backup --help | grep -q -- --compression; then compression_args=(--compression "$COMPRESSION"); fi
       # Interrupted network sessions leave repository locks behind. Restic's
       # normal unlock removes only stale locks and preserves active ones.
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
         unlock
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
-        backup --compression "$COMPRESSION" --tag "photosync-$SERVER_ID" "${SOURCE_PATHS[@]}" "$@"
+        backup --one-file-system "${compression_args[@]}" --tag "photosync-$SERVER_ID" "${SOURCE_PATHS[@]}" "$@"
       ;;
     dry-run)
       # A controller dry run validates authentication and repository access.
@@ -1147,8 +1227,8 @@ restic_controller_command() {
 write_controller_jobs() {
   local id=$1 service timer maintenance_service maintenance_timer
   load_controller_server "$id"
-  install -m 0700 -o root -g root "$(readlink -f "$0")" "$RESTIC_INSTALL_PATH"
-  install -d -m 0700 -o root -g root /var/cache/photosync-restic
+  hp_install_self
+  install -d -m 0700 -o root -g root "$HOME_PHOTOS_DIR/cache/restic"
   service="/etc/systemd/system/photosync-restic-${id}-backup.service"
   timer="/etc/systemd/system/photosync-restic-${id}-backup.timer"
   maintenance_service="/etc/systemd/system/photosync-restic-${id}-maintenance.service"
@@ -1156,7 +1236,7 @@ write_controller_jobs() {
   {
     printf '[Unit]\nDescription=Restic backup to %s\nAfter=network-online.target\nWants=network-online.target\n' "$SERVER_LABEL"
     printf 'StartLimitIntervalSec=6h\nStartLimitBurst=6\n'
-    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/var/cache/photosync-restic\n'
+    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/etc/homephotos/cache/restic\n'
     printf 'ExecStart=%s restic-run %s\nRestart=on-failure\nRestartSec=30m\n' "$RESTIC_INSTALL_PATH" "$id"
   } > "$service"
   {
@@ -1167,7 +1247,7 @@ write_controller_jobs() {
   {
     printf '[Unit]\nDescription=Restic retention and integrity check for %s\nAfter=network-online.target\nWants=network-online.target\n' "$SERVER_LABEL"
     printf 'StartLimitIntervalSec=6h\nStartLimitBurst=6\n'
-    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/var/cache/photosync-restic\n'
+    printf '[Service]\nType=oneshot\nEnvironment=HOME=/root\nEnvironment=XDG_CACHE_HOME=/etc/homephotos/cache/restic\n'
     printf 'ExecStart=%s restic-maintenance %s\nRestart=on-failure\nRestartSec=30m\n' "$RESTIC_INSTALL_PATH" "$id"
   } > "$maintenance_service"
   {
@@ -1258,12 +1338,18 @@ show_controller_server_info() {
 }
 
 show_controller_recovery_credentials() {
-  local id=$1 dir admin_password repository_password
-  load_controller_server "$id"
+  local id=$1 dir repository_dir admin_password repository_password
+  if [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
+    hp_resolve_repository "$id"
+    repository_dir=$(hp_resource_dir repository "$id")
+  else
+    load_controller_server "$id"
+    repository_dir=$(controller_server_dir "$id")
+  fi
   confirm "Display recovery credentials for $SERVER_LABEL on screen?" || return 0
-  dir=$(controller_server_dir "$id")
+  dir=$(controller_server_dir "$SERVER_ID")
   admin_password=$(decrypt_controller_secret "$dir/admin-password.cred")
-  repository_password=$(decrypt_controller_secret "$dir/repository-password.cred")
+  repository_password=$(decrypt_controller_secret "$repository_dir/repository-password.cred")
   printf '\nBackup host                : %s\n' "$BACKUP_HOST"
   printf 'Administrator username    : %s\n' "$ADMIN_USER"
   printf 'Administrator password    : %s\n' "$admin_password"
@@ -1453,17 +1539,17 @@ controller_server_menu() {
       'Go back' \
       'Quit'
     case "$MENU_INDEX" in
-      0) show_controller_server_info "$id"; press_enter_to_continue ;;
-      1) dry_run_controller_server "$id"; press_enter_to_continue ;;
-      2) restic_controller_command "$id" backup; press_enter_to_continue ;;
-      3) restic_controller_command "$id" snapshots; press_enter_to_continue ;;
-      4) edit_controller_connection "$id" ;;
-      5) edit_controller_backup_settings "$id" ;;
+      0) hp_action show_controller_server_info "$id" ;;
+      1) hp_action dry_run_controller_server "$id" ;;
+      2) hp_action restic_controller_command "$id" backup ;;
+      3) hp_action restic_controller_command "$id" snapshots ;;
+      4) hp_action edit_controller_connection "$id" ;;
+      5) hp_action edit_controller_backup_settings "$id" ;;
       6) ensure_remote_backup_storage "$id"; provision_controller_server "$id"; write_controller_jobs "$id"; press_enter_to_continue ;;
       7) show_controller_recovery_credentials "$id" ;;
       8) delete_controller_server "$id"; return 0 ;;
       9) return 0 ;;
-      10) exit 0 ;;
+      10) return 0 ;;
     esac
   done
 }
@@ -1493,7 +1579,6 @@ dry_run_all_controller_servers() {
 }
 
 restic_controller_menu() {
-  ensure_restic_controller
   while :; do
     choose_menu 'Restic backup management (runs from this primary server)' \
       'Add a Restic backup server' \
@@ -1502,11 +1587,11 @@ restic_controller_menu() {
       'Go back' \
       'Quit'
     case "$MENU_INDEX" in
-      0) add_controller_server ;;
-      1) list_and_manage_controller_servers ;;
-      2) dry_run_all_controller_servers ;;
+      0) hp_action add_controller_server ;;
+      1) hp_action list_and_manage_controller_servers ;;
+      2) hp_action dry_run_all_controller_servers ;;
       3) return 0 ;;
-      4) exit 0 ;;
+      4) return 0 ;;
     esac
   done
 }
@@ -1641,8 +1726,13 @@ Usage: sudo ./$SCRIPT_NAME [primary|add-samba|list-samba|change-samba-password|d
        sudo ./$SCRIPT_NAME restic-maintenance SERVER_ID
        sudo ./$SCRIPT_NAME restic-dry-run SERVER_ID
 
-Without an argument, the primary-only management menu opens. Backup servers
-are installed and managed remotely from this primary server.
+       sudo ./$SCRIPT_NAME icloud-run PROFILE_ID [auth|test|fast|full|reconcile]
+       sudo ./$SCRIPT_NAME library-check LIBRARY_ID
+
+Without an argument, the colored HomePhotos menu opens (Up/Down + Enter).
+Debian 11+ required. Configuration/private state: /etc/homephotos/.
+No wizard. Each operation returns to its menu. Optional applications have
+additional prerequisites. Existing photos are never automatically migrated.
 EOF
 }
 
@@ -1652,7 +1742,15 @@ main() {
     -h|--help|help) usage; exit 0 ;;
   esac
   require_root
+  hp_require_debian
+  hp_init
   case "$role" in
+    library-check) hp_library_load "$server_id"; return;;
+    icloud-run) hp_icloud_run "$server_id" "${3:-full}"; return;;
+    immich-start) hp_immich_start; return;;
+    immich-stop) hp_immich_stop; return;;
+    immich-supervise) hp_immich_supervise; return;;
+    restic-secret) decrypt_controller_secret "$(hp_restic_secret_path "$server_id")"; return;;
     restic-run)
       [ -n "$server_id" ] || die 'restic-run requires a server id.'
       restic_controller_command "$server_id" backup
@@ -1671,19 +1769,1748 @@ main() {
   esac
   require_tty
   case "$role" in
-    '') primary_menu; exit 0 ;;
+    '') hp_main_menu; exit 0 ;;
     primary|add-samba|list-samba|change-samba-password|delete-samba) ;;
     *) die "Unknown role: $role. Use primary, add-samba, list-samba, change-samba-password, delete-samba, or --help." ;;
   esac
 
   case "$role" in
-    primary) setup_primary ;;
+    primary) hp_main_menu ;;
     add-samba) add_phone_backup_share ;;
     list-samba) list_samba_shares ;;
     change-samba-password) change_samba_password ;;
     delete-samba) delete_samba_share ;;
   esac
 }
+
+# HomePhotos v1: state is private and isolated from photo storage.
+hp_require_debian() {
+  local ID='' VERSION_ID=''
+  . "${1:-/etc/os-release}"
+  [[ $ID == debian && $VERSION_ID =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'HomePhotos requires Debian 11 or newer.'
+  (( ${VERSION_ID%%.*} >= 11 )) || die 'HomePhotos requires Debian 11 or newer.'
+}
+
+hp_init() {
+  umask 077
+  local private
+  for private in "$HOME_PHOTOS_DIR" "$HOME_PHOTOS_DIR"/{libraries,icloud,keys,logs,cache,tmp,archives,restic,venvs}; do
+    [[ ! -L $private ]] || die 'Private state directory must not be a symlink.'
+    [[ ! -e $private || $(stat -c %u -- "$private") == "$EUID" ]] || die 'Private state must be owned by the running administrator.'
+  done
+  mkdir -p "$HOME_PHOTOS_DIR"/{libraries,icloud,keys,logs,cache,tmp,archives}
+  chmod 0700 "$HOME_PHOTOS_DIR"
+  export TMPDIR="$HOME_PHOTOS_DIR/tmp"
+}
+
+hp_safe_path() {
+  [[ $1 =~ ^/[A-Za-z0-9_./-]+$ && $1 != / && $1 != */../* && $1 != */.. && $1 != */./* ]]
+}
+
+hp_storage_check() {
+  local path=$1 expected=${2:-} uuid dev root fsroot
+  hp_safe_path "$path" || die 'Use an absolute storage path without spaces or special characters.'
+  [[ -d $path && $(realpath -e -- "$path") == "$path" ]] || die 'Storage path must exist and have no symlinks.'
+  uuid=$(findmnt -rn --mountpoint "$path" -o UUID) || die 'Storage is not an exact mount point.'
+  dev=$(findmnt -rn --mountpoint "$path" -o MAJ:MIN) || die 'Cannot identify storage device.'
+  root=$(findmnt -rn --target / -o MAJ:MIN) || die 'Cannot identify root filesystem.'
+  fsroot=$(findmnt -rn --mountpoint "$path" -o FSROOT) || die 'Cannot identify filesystem root.'
+  [[ -n $uuid && -n $dev && -n $root && $dev != "$root" && $fsroot == / ]] || die 'Refusing root filesystem, bind subtree, or unidentified storage.'
+  [[ -z $expected || $uuid == "$expected" ]] || die 'Storage UUID changed; refusing to write.'
+  HP_CHECK_UUID=$uuid
+}
+
+hp_storage_save() {
+  local path=$1
+  hp_storage_check "$path"
+  hp_init
+  # Do not silently redirect existing library registrations to another drive.
+  if [[ -f $HOME_PHOTOS_DIR/storage.conf ]]; then
+    hp_storage_load
+    [[ $path == "$HP_STORAGE_MOUNT" && $HP_CHECK_UUID == "$HP_STORAGE_UUID" ]] || die 'Storage already configured; manual reviewed migration required.'
+  fi
+  {
+    printf 'HP_STORAGE_MOUNT=%q\n' "$path"
+    printf 'HP_STORAGE_UUID=%q\n' "$HP_CHECK_UUID"
+  } > "$HOME_PHOTOS_DIR/storage.conf.tmp"
+  mv -- "$HOME_PHOTOS_DIR/storage.conf.tmp" "$HOME_PHOTOS_DIR/storage.conf"
+}
+
+hp_storage_load() {
+  [[ -f $HOME_PHOTOS_DIR/storage.conf ]] || die 'Configure an existing mounted storage filesystem first.'
+  . "$HOME_PHOTOS_DIR/storage.conf"
+}
+
+hp_storage_guard() {
+  hp_storage_load
+  hp_storage_check "$HP_STORAGE_MOUNT" "$HP_STORAGE_UUID"
+}
+
+hp_library_path_guard() {
+  local path=$1 resolved
+  hp_storage_guard
+  hp_safe_path "$path" || die 'Unsafe library path.'
+  resolved=$(realpath -m -- "$path")
+  [[ $resolved == "$path" && $path == "$HP_STORAGE_MOUNT/"* ]] || die 'Library must be inside configured storage without symlinks.'
+  # Reject nested mounts: a different disk below storage must not bypass UUID checks.
+  local owner
+  owner=$(findmnt -rn --target "$(dirname "$path")" -o TARGET) || die 'Cannot identify library backing mount.'
+  [[ $owner == "$HP_STORAGE_MOUNT" ]] || die 'Library parent is on another mount.'
+  if [[ -e $path ]]; then
+    owner=$(findmnt -rn --target "$path" -o TARGET) || die 'Cannot identify library backing mount.'
+    [[ $owner == "$HP_STORAGE_MOUNT" ]] || die 'Library is on another mount.'
+  fi
+}
+
+hp_library_save() {
+  local id=$1 path=$2 mode=$3
+  valid_name "$id" || die 'Invalid library id.'
+  hp_library_path_guard "$path"
+  hp_init
+  [[ ! -e $HOME_PHOTOS_DIR/libraries/$id.conf ]] || die 'Library id already exists.'
+  case $mode in
+    create) [[ ! -e $path ]] || die 'Path exists: choose adopt.'; mkdir -m 0700 -- "$path" ;;
+    adopt) [[ -d $path ]] || die 'Adopt requires an existing directory.' ;;
+    *) die 'Choose create or adopt.' ;;
+  esac
+  printf 'HP_LIBRARY_PATH=%q\n' "$path" > "$HOME_PHOTOS_DIR/libraries/$id.conf"
+}
+
+hp_library_load() {
+  valid_name "$1" || die 'Invalid library id.'
+  [[ -f $HOME_PHOTOS_DIR/libraries/$1.conf ]] || die 'Library not registered.'
+  . "$HOME_PHOTOS_DIR/libraries/$1.conf"
+  hp_library_path_guard "$HP_LIBRARY_PATH"
+  [[ -d $HP_LIBRARY_PATH ]] || die 'Library directory missing.'
+}
+
+hp_icloud_profile_save() {
+  local id=$1 username=$2 library=$3 dir
+  valid_name "$id" && valid_name "$library" || die 'Invalid profile/library id.'
+  [[ $username =~ ^[A-Za-z0-9_.+@-]+$ && $username == *@* ]] || die 'Enter an Apple account email address.'
+  hp_library_load "$library"
+  hp_init
+  dir="$HOME_PHOTOS_DIR/icloud/$id"
+  [[ ! -e $dir/profile.conf ]] || die 'Profile already exists.'
+  mkdir -p "$dir"/{cookies,config,cache,data}
+  {
+    printf 'HP_ICLOUD_USERNAME=%q\n' "$username"
+    printf 'HP_ICLOUD_LIBRARY=%q\n' "$library"
+    printf 'HP_ICLOUD_APPLE_LIBRARY=%q\n' "${4:-Personal Library}"
+    printf 'HP_ICLOUD_DESTINATION=%q\n' "$HP_LIBRARY_PATH/imports/icloud-$id"
+  } > "$dir/profile.conf"
+}
+
+hp_icloud_profile_ids() {
+  local file
+  for file in "$HOME_PHOTOS_DIR"/icloud/*/profile.conf; do
+    [[ -f $file ]] || continue
+    basename "$(dirname "$file")"
+  done | LC_ALL=C sort
+}
+
+hp_icloud_select_profile() {
+  local id username file
+  local -a ids=() labels=()
+  mapfile -t ids < <(hp_icloud_profile_ids)
+  if (( ${#ids[@]} == 0 )); then
+    note 'No iCloud profile is configured. Add and authenticate a profile first.'
+    return 1
+  fi
+  for id in "${ids[@]}"; do
+    file="$HOME_PHOTOS_DIR/icloud/$id/profile.conf"
+    HP_ICLOUD_USERNAME=
+    . "$file"
+    username=${HP_ICLOUD_USERNAME:-unknown-account}
+    labels+=("$id — $username")
+  done
+  choose_menu 'Select iCloud profile' "${labels[@]}"
+  HP_SELECTED_ICLOUD_PROFILE=${ids[$MENU_INDEX]}
+}
+
+hp_icloud_select_apple_library() {
+  local id=$1 dir binary output
+  local -a libraries=()
+  valid_name "$id" || die 'Invalid iCloud profile id.'
+  dir="$HOME_PHOTOS_DIR/icloud/$id"
+  [[ -f $dir/profile.conf ]] || die 'iCloud profile not configured.'
+  . "$dir/profile.conf"
+  binary="$HOME_PHOTOS_DIR/venvs/icloudpd/bin/icloudpd"
+  [[ -x $binary ]] || die 'Install native icloudpd first.'
+  output=$(mktemp "$HOME_PHOTOS_DIR/tmp/icloud-libraries.XXXXXX")
+  if ! HOME="$dir" XDG_CONFIG_HOME="$dir/config" XDG_CACHE_HOME="$dir/cache" XDG_DATA_HOME="$dir/data" \
+    "$binary" --username "$HP_ICLOUD_USERNAME" --cookie-directory "$dir/cookies" \
+      --list-libraries --log-level error --no-progress-bar >"$output"; then
+    rm -f -- "$output"
+    die 'Could not list Apple Photos libraries. Authenticate or renew this profile first.'
+  fi
+  mapfile -t libraries < <(grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' "$output" | sed -e '/^[[:space:]]*$/d')
+  rm -f -- "$output"
+  (( ${#libraries[@]} > 0 )) || die 'The account returned no Apple Photos libraries.'
+  choose_menu 'Select Apple Photos library' "${libraries[@]}"
+  HP_SELECTED_APPLE_LIBRARY=${libraries[$MENU_INDEX]}
+}
+
+hp_icloud_profile_set_apple_library() {
+  local id=$1 apple_library=$2 dir temp
+  valid_name "$id" || die 'Invalid iCloud profile id.'
+  [[ -n $apple_library && $apple_library != *$'\n'* && $apple_library != *$'\r'* ]] || die 'Invalid Apple Photos library name.'
+  dir="$HOME_PHOTOS_DIR/icloud/$id"
+  [[ -f $dir/profile.conf ]] || die 'iCloud profile not configured.'
+  . "$dir/profile.conf"
+  temp=$(mktemp "$dir/profile.conf.XXXXXX")
+  {
+    printf 'HP_ICLOUD_USERNAME=%q\n' "$HP_ICLOUD_USERNAME"
+    printf 'HP_ICLOUD_LIBRARY=%q\n' "$HP_ICLOUD_LIBRARY"
+    printf 'HP_ICLOUD_APPLE_LIBRARY=%q\n' "$apple_library"
+    printf 'HP_ICLOUD_DESTINATION=%q\n' "$HP_ICLOUD_DESTINATION"
+  } > "$temp"
+  chmod 0600 "$temp"
+  mv -- "$temp" "$dir/profile.conf"
+  note "Apple Photos library updated to: $apple_library"
+}
+
+hp_icloud_edit_apple_library() {
+  hp_icloud_select_profile || return 1
+  local id=$HP_SELECTED_ICLOUD_PROFILE
+  hp_icloud_select_apple_library "$id"
+  hp_icloud_profile_set_apple_library "$id" "$HP_SELECTED_APPLE_LIBRARY"
+}
+
+hp_icloud_run() (
+  local id=$1 mode=$2 dir binary
+  valid_name "$id" || die 'Invalid iCloud profile id.'
+  dir="$HOME_PHOTOS_DIR/icloud/$id"
+  [[ -f $dir/profile.conf ]] || die 'iCloud profile not configured.'
+  . "$dir/profile.conf"
+  hp_library_load "$HP_ICLOUD_LIBRARY"
+  binary="$HOME_PHOTOS_DIR/venvs/icloudpd/bin/icloudpd"
+  [[ -x $binary ]] || die 'Install native icloudpd first.'
+  hp_init
+  export HOME="$dir" XDG_CONFIG_HOME="$dir/config" XDG_CACHE_HOME="$dir/cache" XDG_DATA_HOME="$dir/data"
+  hp_library_path_guard "$HP_LIBRARY_PATH/imports"
+  mkdir -p -m 0700 -- "$HP_LIBRARY_PATH/imports"
+  hp_library_path_guard "$HP_ICLOUD_DESTINATION"
+  mkdir -p -m 0700 -- "$HP_ICLOUD_DESTINATION"
+  export TZ=Etc/UTC
+  local args=(--username "$HP_ICLOUD_USERNAME" --directory "$HP_ICLOUD_DESTINATION" --cookie-directory "$dir/cookies" --library "$HP_ICLOUD_APPLE_LIBRARY" --size original --live-photo-size original --folder-structure '{:%Y/%m/%d}')
+  case $mode in
+    auth) args+=(--auth-only) ;;
+    test) args+=(--recent 10) ;;
+    fast|sync) args+=(--until-found 25) ;;
+    full|reconcile) : ;;
+    *) die 'Unsupported iCloud action: only auth, test, fast, full, reconcile.' ;;
+  esac
+  # One process per account; no deletion or cloud modification flags ever.
+  exec 9> "$dir/run.lock"
+  flock -n 9 || die 'This iCloud profile is already running.'
+  if "$binary" "${args[@]}"; then
+    printf 'success %s\n' "$mode" > "$dir/status"
+  else
+    printf 'failed: review private log; re-authenticate interactively if session expired\n' > "$dir/status"
+    return 1
+  fi
+)
+
+hp_install_self() {
+  [[ $(realpath -m -- "${BASH_SOURCE[0]}") == $(realpath -m -- "$RESTIC_INSTALL_PATH") ]] || install -m 0700 "${BASH_SOURCE[0]}" "$RESTIC_INSTALL_PATH"
+}
+
+hp_icloud_install() {
+  local python=${1:-python3} arch wheel
+  arch=$(uname -m)
+  case $arch in
+    x86_64|aarch64|armv7l) ;;
+    *) die "No pinned icloudpd 1.32.3 manylinux binary wheel for architecture: $arch"; return 1;;
+  esac
+  # These platform wheels embed icloudpd's runtime; Debian 11 Python 3.9
+  # is only the installer/venv host, not the application's Python runtime.
+  "$python" -c 'import sys; assert sys.version_info[:2] >= (3,9)' || { die 'Python 3.9+ with venv is required; system Python is never replaced.'; return 1; }
+  hp_init || return 1
+  [[ $python != python3 && $python != /usr/bin/python3 ]] || install_packages python3-venv ca-certificates || return 1
+  install -d -m 0700 "$HOME_PHOTOS_DIR/cache" "$HOME_PHOTOS_DIR/cache/pip" "$HOME_PHOTOS_DIR/cache/icloudpd" || return 1
+  wheel=$("$python" - "$arch" "$HOME_PHOTOS_DIR/cache/icloudpd" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.request
+from urllib.parse import urlsplit
+
+os.umask(0o077)
+tags = {
+    'x86_64': 'manylinux1_x86_64.manylinux_2_5_x86_64',
+    'aarch64': 'manylinux2014_aarch64.manylinux_2_17_aarch64',
+    'armv7l': 'manylinux2014_armv7l.manylinux_2_17_armv7l',
+}
+filename = 'icloudpd-1.32.3-py2.py3-none-' + tags[sys.argv[1]] + '.whl'
+with urllib.request.urlopen('https://pypi.org/pypi/icloudpd/1.32.3/json', timeout=60) as response:
+    metadata = json.load(response)
+matching = [item for item in metadata['urls'] if item['filename'] == filename
+            and item.get('packagetype') == 'bdist_wheel' and not item.get('yanked')]
+if len(matching) != 1:
+    raise SystemExit('Expected exactly one official pinned manylinux wheel; no source/universal fallback.')
+item = matching[0]
+url = urlsplit(item['url'])
+if url.scheme != 'https' or url.netloc != 'files.pythonhosted.org':
+    raise SystemExit('Rejected non-official wheel download URL.')
+expected = item['digests']['sha256']
+if not re.fullmatch(r'[0-9a-f]{64}', expected):
+    raise SystemExit('Invalid PyPI SHA256 digest.')
+target = Path(sys.argv[2]) / filename
+partial = target.with_suffix('.whl.part')
+try:
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(item['url'], timeout=120) as response, partial.open('wb') as output:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise SystemExit('PyPI wheel SHA256 verification failed; refusing installation.')
+    os.replace(partial, target)
+    target.chmod(0o600)
+finally:
+    if partial.exists():
+        partial.unlink()
+print(target)
+PY
+  ) || { die 'Could not download and verify the pinned icloudpd binary wheel.'; return 1; }
+  "$python" -m venv "$HOME_PHOTOS_DIR/venvs/icloudpd" || return 1
+  PIP_CACHE_DIR="$HOME_PHOTOS_DIR/cache/pip" "$HOME_PHOTOS_DIR/venvs/icloudpd/bin/python" -m pip install --no-index --no-deps --only-binary=:all: --upgrade "$wheel" || return 1
+  "$HOME_PHOTOS_DIR/venvs/icloudpd/bin/icloudpd" --version || { die 'icloudpd binary smoke test failed.'; return 1; }
+}
+
+hp_icloud_background() {
+  local id=$1 unit
+  valid_name "$id" || die 'Invalid iCloud profile id.'
+  [[ -f $HOME_PHOTOS_DIR/icloud/$id/profile.conf ]] || die 'Profile missing.'
+  . "$HOME_PHOTOS_DIR/icloud/$id/profile.conf"
+  hp_library_load "$HP_ICLOUD_LIBRARY"
+  hp_init
+  hp_install_self
+  unit="${HP_SYSTEMD_DIR:-/etc/systemd/system}/homephotos-icloud-$id.service"
+  cat > "$unit" <<EOF
+[Unit]
+Description=HomePhotos copy-only iCloud download ($id)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=$HP_STORAGE_MOUNT
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=$RESTIC_INSTALL_PATH icloud-run $id full
+StandardInput=null
+StandardOutput=append:$HOME_PHOTOS_DIR/logs/icloud-$id.log
+StandardError=append:$HOME_PHOTOS_DIR/logs/icloud-$id.log
+TimeoutStartSec=infinity
+KillMode=control-group
+EOF
+  chmod 0644 "$unit"
+  systemctl daemon-reload
+  systemctl start --no-block "homephotos-icloud-$id.service"
+  note 'Background copy started. Expired Apple sessions require interactive authentication; see status/logs.'
+}
+
+# Execute outside a conditional: Bash otherwise disables errexit inside functions.
+hp_action() {
+  local status
+  set +e
+  ( set -Eeuo pipefail; trap 'exit 130' INT; "$@" )
+  status=$?
+  set -e
+  [[ $status == 0 ]] || printf '\nAction failed/cancelled (%s). No automatic rollback was attempted.\n' "$status" >&2
+  press_enter_to_continue || true
+  return 0
+}
+
+hp_samba_render() {
+  local library=$1 share=$2 username=$3
+  hp_library_load "$library"
+  printf '\n[%s]\n   path = %s\n' "$share" "$HP_LIBRARY_PATH/uploads/$share"
+  printf '   valid users = %s\n   read only = no\n   guest ok = no\n' "$username"
+  printf '   create mask = 0600\n   directory mask = 0700\n'
+  printf '   root preexec = %s library-check %s\n   root preexec close = yes\n' "$RESTIC_INSTALL_PATH" "$library"
+}
+
+hp_samba_share() {
+  local library=$1 share=$2 username=$3 temp ancestor
+  valid_name "$share" && valid_name "$username" || die 'Invalid share/user name.'
+  [[ $username != root ]] || die 'Root cannot be an SMB user.'
+  ! id "$username" >/dev/null 2>&1 || die 'Use a new dedicated username; existing accounts are never repurposed.'
+  hp_library_load "$library"
+  hp_library_path_guard "$HP_LIBRARY_PATH/uploads"
+  mkdir -p -m 0711 -- "$HP_LIBRARY_PATH/uploads"
+  hp_library_path_guard "$HP_LIBRARY_PATH/uploads/$share"
+  [[ ! -e $HP_LIBRARY_PATH/uploads/$share ]] || die 'Upload directory already exists; refusing ownership changes.'
+  ensure_samba_include
+  ! testparm -s --section-name="$share" 2>/dev/null | grep -q '^\[' || die 'Share already exists.'
+  hp_init
+  hp_install_self
+  temp=$(mktemp)
+  cp -- "$SMB_MANAGED_CONF" "$temp"
+  hp_samba_render "$library" "$share" "$username" >> "$temp"
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$username"
+  smbpasswd -a "$username"
+  install -d -m 0700 -o "$username" -g "$(id -gn "$username")" "$HP_LIBRARY_PATH/uploads/$share"
+  # Add traversal only, never recursive ownership or photo permission changes.
+  install_packages acl
+  ancestor="$HP_LIBRARY_PATH/uploads"
+  while :; do
+    setfacl -m "u:$username:--x" -- "$ancestor"
+    [[ $ancestor != / ]] || break
+    ancestor=$(dirname -- "$ancestor")
+  done
+  backup_file "$SMB_MANAGED_CONF"
+  install -m 0600 "$temp" "$SMB_MANAGED_CONF"
+  rm -- "$temp"
+  testparm -s >/dev/null
+  systemctl enable --now smbd
+  systemctl reload smbd
+}
+
+hp_storage_prompt() {
+  ask 'Existing exact data-disk mount (no formatting or moving)' /mnt/photos
+  hp_storage_save "$REPLY"
+}
+
+hp_library_prompt() {
+  local id path mode
+  ask_name 'Library id' family; id=$REPLY
+  hp_storage_guard
+  ask 'Library directory' "$HP_STORAGE_MOUNT/$id"; path=$REPLY
+  choose_menu 'Library operation' 'Create new empty directory' 'Adopt existing directory without changing files' 'Cancel'
+  case $MENU_INDEX in 0) mode=create;; 1) mode=adopt;; *) return;; esac
+  hp_library_save "$id" "$path" "$mode"
+}
+
+hp_samba_prompt() {
+  local library share user
+  hp_select_library || return 1
+  library=$HP_SELECTED_LIBRARY
+  ask_name 'Share name' phone; share=$REPLY
+  ask_name 'New dedicated username' phone; user=$REPLY
+  hp_samba_share "$library" "$share" "$user"
+}
+
+hp_icloud_prompt() {
+  local id user library
+  ask_name 'Profile id' apple; id=$REPLY
+  ask 'Apple account email'; user=$REPLY
+  hp_select_library || return 1
+  library=$HP_SELECTED_LIBRARY
+  hp_icloud_profile_save "$id" "$user" "$library" 'PrimarySync'
+  note 'Profile created. Authenticate it, then use Select/change Apple library if using a shared library.'
+}
+
+hp_icloud_install_prompt() {
+  ask 'Python executable (3.9+ with venv; pinned Linux binary wheel, Debian 11 supported)' python3
+  hp_icloud_install "$REPLY"
+}
+
+hp_icloud_selected_action() {
+  local action=$1 id
+  hp_icloud_select_profile || return 1
+  id=$HP_SELECTED_ICLOUD_PROFILE
+  case $action in
+    background) hp_icloud_background "$id";;
+    status) systemctl status --no-pager "homephotos-icloud-$id.service"; ;;
+    stop) systemctl stop "homephotos-icloud-$id.service";;
+    *) hp_icloud_run "$id" "$action";;
+  esac
+}
+
+hp_icloud_delete_prompt() {
+  hp_icloud_select_profile || return 1
+  local id=$HP_SELECTED_ICLOUD_PROFILE dir unit
+  dir="$HOME_PHOTOS_DIR/icloud/$id"
+  choose_menu "Delete iCloud profile '$id'? Downloaded photos will NOT be deleted." 'Cancel' "Delete profile '$id'"
+  [[ $MENU_INDEX == 1 ]] || return 0
+  unit="${HP_SYSTEMD_DIR:-/etc/systemd/system}/homephotos-icloud-$id.service"
+  systemctl stop "homephotos-icloud-$id.service" 2>/dev/null || true
+  if [[ -f $unit ]]; then
+    systemctl disable "homephotos-icloud-$id.service" 2>/dev/null || true
+    rm -f -- "$unit"
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  rm -rf -- "$dir"
+  note "Profile '$id' removed. Downloaded photos in storage were kept."
+}
+
+hp_icloud_menu() {
+  while :; do
+    choose_menu 'HomePhotos · iCloud copy-only imports' 'Install native icloudpd' 'Add profile' 'Authenticate / renew session' 'Select/change Apple library' 'Test download (10 recent items)' 'Sync new photos only (fast)' 'Rescan and sync missing photos' 'Start full download in background' 'Background status' 'Stop background job' 'Remove profile (keep downloaded photos)' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_icloud_install_prompt;; 1) hp_action hp_icloud_prompt;;
+      2) hp_action hp_icloud_selected_action auth;; 3) hp_action hp_icloud_edit_apple_library;;
+      4) hp_action hp_icloud_selected_action test;; 5) hp_action hp_icloud_selected_action fast;;
+      6) hp_action hp_icloud_selected_action reconcile;; 7) hp_action hp_icloud_selected_action background;;
+      8) hp_action hp_icloud_selected_action status;; 9) hp_action hp_icloud_selected_action stop;;
+      10) hp_action hp_icloud_delete_prompt;; 11) return;;
+    esac
+  done
+}
+
+hp_status() {
+  printf 'HomePhotos v1\nPrivate state: %s\n' "$HOME_PHOTOS_DIR"
+  if [[ -f $HOME_PHOTOS_DIR/storage.conf ]]; then
+    hp_storage_load
+    printf 'Storage: %s\nExpected UUID: %s\n' "$HP_STORAGE_MOUNT" "$HP_STORAGE_UUID"
+    (hp_storage_guard) && df -h "$HP_STORAGE_MOUNT" || printf 'WARNING: storage unavailable or identity mismatch.\n'
+  else
+    printf 'Storage not registered.\n'
+  fi
+  hp_library_list
+  printf '\nRestic profiles:\n'; controller_server_ids
+}
+
+hp_library_list() {
+  local file
+  printf '\nRegistered libraries:\n'
+  for file in "$HOME_PHOTOS_DIR"/libraries/*.conf; do
+    [[ -f $file ]] || continue
+    printf '  %s\n' "$(basename "$file" .conf)"
+  done
+}
+
+hp_select_library() {
+  local id file path
+  local -a ids=() labels=()
+  for file in "$HOME_PHOTOS_DIR"/libraries/*.conf; do
+    [[ -f $file ]] || continue
+    id=$(basename "$file" .conf)
+    HP_LIBRARY_PATH=
+    . "$file"
+    path=${HP_LIBRARY_PATH:-unknown-path}
+    ids+=("$id")
+    labels+=("$id — $path")
+  done
+  if (( ${#ids[@]} == 0 )); then
+    note 'No photo library is registered. Create or adopt a library first.'
+    return 1
+  fi
+  choose_menu 'Select registered photo library' "${labels[@]}"
+  HP_SELECTED_LIBRARY=${ids[$MENU_INDEX]}
+}
+
+hp_storage_setup() {
+  [[ ! -f $HOME_PHOTOS_DIR/storage.conf ]] || die 'Storage is already registered. Do not reformat; use status.'
+  setup_storage /mnt/photos PHOTOS
+  hp_storage_save "$MOUNTPOINT"
+}
+
+hp_storage_menu() {
+  while :; do
+    choose_menu 'Storage' 'View status' 'Register existing mounted disk' 'Configure storage disk (formatting requires confirmation)' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_status;; 1) hp_action hp_storage_prompt;;
+      2) hp_action hp_storage_setup;; *) return;;
+    esac
+  done
+}
+
+hp_library_menu() {
+  while :; do
+    choose_menu 'Photo libraries' 'List libraries' 'Create / adopt library' 'Back'
+    case $MENU_INDEX in 0) hp_action hp_library_list;; 1) hp_action hp_library_prompt;; *) return;; esac
+  done
+}
+
+hp_samba_menu() {
+  while :; do
+    choose_menu 'Phone uploads · Samba' 'Add PhotoSync upload destination' 'List shares and connection paths' 'Change Samba password' 'Remove share access (keep files)' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_samba_prompt;; 1) hp_action list_samba_shares;;
+      2) hp_action change_samba_password;; 3) hp_action delete_samba_share;; *) return;;
+    esac
+  done
+}
+
+hp_main_menu() {
+  while :; do
+    choose_menu 'HomePhotos v1 · Independent management actions' 'Storage management' 'Photo libraries' 'Phone uploads (Samba)' 'iCloud downloads' 'Restic backup management' 'Immich gallery' 'Exit' 'System status'
+    case $MENU_INDEX in
+      0) hp_storage_menu;; 1) hp_library_menu;; 2) hp_samba_menu;;
+      3) hp_icloud_menu;; 4) restic_controller_menu;;
+      5) hp_immich_menu;; 6) return 0;; 7) hp_action hp_status;;
+    esac
+  done
+}
+
+hp_restic_source_guard() {
+  local path mount rootdev dev
+  ((${#SOURCE_PATHS[@]} > 0)) || die 'Backup job has no source paths configured. Edit the job and add at least one source before running it.'
+  rootdev=$(findmnt -rn --target / -o MAJ:MIN) || die 'Cannot identify root filesystem.'
+  for path in "${SOURCE_PATHS[@]}"; do
+    [[ -d $path && $(realpath -e -- "$path") == "$path" ]] || die 'Restic source missing or symlinked.'
+    if [[ -f $HOME_PHOTOS_DIR/storage.conf ]]; then
+      hp_storage_guard
+      [[ $path == "$HP_STORAGE_MOUNT" || $path == "$HP_STORAGE_MOUNT/"* || $path == "$HOME_PHOTOS_DIR" || $path == "$HOME_PHOTOS_DIR/"* ]] || die 'Restic source must be registered photo storage or private HomePhotos state.'
+    fi
+    mount=$(findmnt -rn --target "$path" -o TARGET) || die 'Restic source has no mount.'
+    dev=$(findmnt -rn --target "$path" -o MAJ:MIN) || die 'Cannot identify Restic source device.'
+    if [[ $path == "$HOME_PHOTOS_DIR" || $path == "$HOME_PHOTOS_DIR/"* ]]; then
+      [[ -d $HOME_PHOTOS_DIR && ! -L $HOME_PHOTOS_DIR ]] || die 'Invalid private backup source.'
+    else
+      if [[ -f $HOME_PHOTOS_DIR/storage.conf ]]; then
+        [[ $mount == "$HP_STORAGE_MOUNT" ]] || die 'Restic source mount differs from registered photo storage.'
+      fi
+      [[ -n $dev && $dev != "$rootdev" && $mount != / ]] || die 'Refusing Restic root-disk fallback.'
+    fi
+  done
+}
+
+# Optional Immich management (embedded to keep distribution standalone).
+# Official docs reviewed 2026-09-27: docs.immich.app/install/{requirements,docker-compose}
+# and administration/backup-and-restore, guides/external-library.
+
+hp_immich_dir() { printf '%s' /etc/homephotos/immich; }
+hp_immich_error() { printf 'Immich: %s\n' "$*" >&2; return 1; }
+hp_immich_valid_path() {
+  [[ $1 =~ ^/[a-zA-Z0-9_./-]+$ && $1 != / && $1 != */ && $1 != *//* && /$1/ != */../* && /$1/ != */./* ]]
+}
+
+hp_immich_install_docker() (
+  local etc_dir=${HP_DOCKER_ETC_DIR:-/etc} os_release=${HP_OS_RELEASE_FILE:-/etc/os-release}
+  [[ $EUID -eq 0 || $etc_dir != /etc ]] || { hp_immich_error 'Root required to install Docker.'; return 1; }
+  local ID='' VERSION_CODENAME='' arch keyring sources
+  . "$os_release"
+  [[ $ID == debian && -n $VERSION_CODENAME ]] || { hp_immich_error 'Official Docker installation requires Debian with VERSION_CODENAME.'; return 1; }
+  arch=$(dpkg --print-architecture) || return 1
+  keyring="$etc_dir/apt/keyrings/docker.asc"
+  sources="$etc_dir/apt/sources.list.d/docker.sources"
+  apt-get update || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl || return 1
+  install -d -m 0755 "$(dirname "$keyring")" "$(dirname "$sources")" || return 1
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    https://download.docker.com/linux/debian/gpg -o "$keyring" || return 1
+  chmod a+r "$keyring" || return 1
+  {
+    printf 'Types: deb\n'
+    printf 'URIs: https://download.docker.com/linux/debian\n'
+    printf 'Suites: %s\n' "$VERSION_CODENAME"
+    printf 'Components: stable\n'
+    printf 'Architectures: %s\n' "$arch"
+    printf 'Signed-By: %s\n' "$keyring"
+  } >"$sources" || return 1
+  apt-get update || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+  systemctl enable --now docker || return 1
+  docker version --format '{{.Server.Version}}' >/dev/null || return 1
+  docker compose version --short >/dev/null || return 1
+  note 'Docker Engine and the Compose plugin were installed from Docker’s signed Debian repository.'
+)
+
+hp_immich_ensure_docker() {
+  if command -v docker >/dev/null && docker version --format '{{.Server.Version}}' >/dev/null 2>&1 \
+    && docker compose version --short >/dev/null 2>&1; then
+    return 0
+  fi
+  choose_menu 'Docker Engine and Compose are required but unavailable. Install them from Docker’s official Debian repository?' 'Cancel' 'Install Docker Engine and Compose'
+  [[ $MENU_INDEX == 1 ]] || return 1
+  hp_immich_install_docker
+}
+
+hp_immich_preflight() (
+  [[ $EUID -eq 0 ]] || { hp_immich_error 'Root required.'; return 1; }
+  local ID VERSION_ID flags ram engine compose
+  . /etc/os-release
+  flags=$(awk -F ': ' '/^flags/{print $2; exit}' /proc/cpuinfo)
+  ram=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  hp_immich_capabilities "$ID" "${VERSION_ID%%.*}" "$(uname -m)" "$(nproc)" "$ram" "$flags" || {
+    hp_immich_error 'Requires Debian 11+, amd64 (x86-64-v2) or arm64, 2 CPUs and 6 GiB RAM.'; return 1;
+  }
+  local cmd
+  for cmd in docker curl openssl findmnt flock realpath sha256sum gzip; do
+    command -v "$cmd" >/dev/null || { hp_immich_error "Install prerequisite: $cmd"; return 1; }
+  done
+  engine=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || return 1
+  compose=$(docker compose version --short 2>/dev/null) || return 1
+  [[ ${engine%%.*} =~ ^[0-9]+$ && ${engine%%.*} -ge 25 ]] || { hp_immich_error 'Docker Engine 25+ required; install via docs.docker.com/engine/install/debian/.'; return 1; }
+  compose=${compose#v}
+  [[ $compose =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+  (( BASH_REMATCH[1] > 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] >= 24) )) || {
+    hp_immich_error 'Docker Compose plugin 2.24+ required.'; return 1;
+  }
+)
+
+# One-time configuration only: moving a live database/media tree is intentionally
+# not implemented. Never source .env; Docker parses it as data.
+hp_immich_configure() (
+  set +x
+  umask 077
+  hp_immich_preflight || return 1
+  local d parent media=$1 db=$2 password fs
+  d=$(hp_immich_dir)
+  [[ ! -e $d/.env ]] || { hp_immich_error 'Already configured; refusing storage or password replacement.'; return 1; }
+  hp_immich_valid_path "$media" && hp_immich_valid_path "$db" || { hp_immich_error 'Use absolute paths with letters, digits, /, _, -, . only.'; return 1; }
+  hp_storage_guard && hp_library_path_guard "$media" || return 1
+  [[ -d $media && -d $db && ! -L $media && ! -L $db ]] || { hp_immich_error 'Create dedicated empty media and database directories first (no symlinks).'; return 1; }
+  [[ $(realpath "$media") == "$media" && $(realpath "$db") == "$db" ]] || return 1
+  [[ $media != "$db" && $media/ != "$db/"* && $db/ != "$media/"* ]] || return 1
+  [[ -z $(find "$media" -mindepth 1 -maxdepth 1 -print -quit) && -z $(find "$db" -mindepth 1 -maxdepth 1 -print -quit) ]] || {
+    hp_immich_error 'Storage directories must be empty; existing originals belong in external library mounts.'; return 1;
+  }
+  fs=$(findmnt -n -o FSTYPE -T "$db") || return 1
+  case $fs in ext4|ext3|ext2|xfs|btrfs|zfs) ;; *) hp_immich_error 'Database must use a local Unix filesystem, never a network share.'; return 1;; esac
+  parent=$(dirname "$d")
+  [[ ! -L $parent && ! -L $d && $(realpath -m "$d") == "$d" ]] || return 1
+  mkdir -p "$d" || return 1
+  chmod 700 "$parent" || return 1
+  chmod 700 "$d" || return 1
+  exec 9>"$d/operation.lock"
+  flock -n 9 || return 1
+  [[ ! -e $d/.env ]] || return 1
+  password=$(openssl rand -hex 32) || return 1
+  hp_immich_storage_record "$media" >"$d/storage.next" && hp_immich_storage_record "$db" >>"$d/storage.next" || return 1
+  mv "$d/storage.next" "$d/storage.tsv" || return 1
+  mkdir -p "$d/model-cache" || return 1
+  hp_immich_override >"$d/override.json" || return 1
+  (set -o noclobber; printf 'UPLOAD_LOCATION=%s\nDB_DATA_LOCATION=%s\nIMMICH_VERSION=v3.2.2\nDB_PASSWORD=%s\nDB_USERNAME=postgres\nDB_DATABASE_NAME=immich\nTZ=Etc/UTC\n' "$media" "$db" "$password" >"$d/.env") || return 1
+  printf 'Configured pinned Immich v3.2.2. Nothing started.\n'
+)
+
+hp_immich_storage_record() {
+  local uuid
+  hp_immich_valid_path "$1" && [[ -d $1 && $(realpath "$1") == "$1" ]] || return 1
+  uuid=$(findmnt -n -o UUID -T "$1") || return 1
+  [[ $uuid =~ ^[a-zA-Z0-9-]+$ ]] || { hp_immich_error 'Storage requires a mounted filesystem with a stable UUID.'; return 1; }
+  printf '%s\t%s\n' "$1" "$uuid"
+}
+
+hp_immich_storage_guard() {
+  local d path uuid actual name mode
+  d=$(hp_immich_dir)
+  [[ -s $d/storage.tsv ]] || return 1
+  while IFS=$'\t' read -r path uuid; do
+    actual=$(hp_immich_storage_record "$path") || return 1
+    [[ $actual == "$path"$'\t'"$uuid" ]] || { hp_immich_error 'Storage UUID changed or mount is missing; refusing start.'; return 1; }
+  done <"$d/storage.tsv"
+  if [[ -f $d/mounts.tsv ]]; then
+    while IFS=$'\t' read -r name path uuid mode; do
+      actual=$(hp_immich_storage_record "$path") || return 1
+      [[ $actual == "$path"$'\t'"$uuid" ]] || return 1
+      [[ -z $mode || $mode == ro || $mode == rw ]] || return 1
+    done <"$d/mounts.tsv"
+  fi
+}
+
+hp_immich_compose() (
+  set +x
+  local d
+  d=$(hp_immich_dir)
+  [[ -f $d/.env && -f $d/docker-compose.yml && -f $d/override.json ]] || { hp_immich_error 'Configure and install first.'; return 1; }
+  # Ignore shell overrides of application settings; secrets stay in .env.
+  unset UPLOAD_LOCATION DB_DATA_LOCATION IMMICH_VERSION DB_PASSWORD DB_USERNAME DB_DATABASE_NAME COMPOSE_FILE COMPOSE_PROFILES
+  docker compose --project-name homephotos-immich --project-directory "$d" --env-file "$d/.env" -f "$d/docker-compose.yml" -f "$d/override.json" "$@"
+)
+
+hp_immich_override() {
+  local d name path uuid mode
+  d=$(hp_immich_dir)
+  # Docker restart remains disabled. Optional recovery/boot startup goes through
+  # the guarded HomePhotos systemd unit so UUID checks always run first.
+  printf '{"services":{"database":{"restart":"no"},"redis":{"restart":"no"},"immich-machine-learning":{"restart":"no","volumes":[{"type":"bind","source":"%s/model-cache","target":"/cache","bind":{"create_host_path":false}}]},"immich-server":{"restart":"no","volumes":[' "$d"
+  local sep=''
+  if [[ -f $d/mounts.tsv ]]; then
+    while IFS=$'\t' read -r name path uuid mode; do
+      # Legacy three-column records were read-write; preserve that behavior.
+      mode=${mode:-rw}
+      printf '%s{"type":"bind","source":"%s","target":"/external/%s"' "$sep" "$path" "$name"
+      [[ $mode != ro ]] || printf ',"read_only":true'
+      printf ',"bind":{"create_host_path":false}}'
+      sep=,
+    done <"$d/mounts.tsv"
+  fi
+  printf ']}}}\n'
+}
+
+hp_immich_mount() (
+  set +x
+  umask 077
+  local action=$1 name=${2-} path=${3-} mode=${4:-rw} d record
+  d=$(hp_immich_dir)
+  [[ -f $d/.env ]] || return 1
+  [[ $action != list ]] || { [[ ! -f $d/mounts.tsv ]] || cat "$d/mounts.tsv"; return 0; }
+  [[ $name =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+  exec 9>"$d/operation.lock"; flock -n 9 || return 1
+  touch "$d/mounts.tsv" || return 1
+  case $action in
+    add)
+      [[ $mode == ro || $mode == rw ]] || return 1
+      record=$(hp_immich_storage_record "$path") || return 1
+      # Never expose private application state or host system trees.
+      case $path in /etc|/etc/*|/root|/root/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*|/run|/run/*) return 1;; esac
+      grep -q "^${name}"$'\t' "$d/mounts.tsv" && return 1
+      cp "$d/mounts.tsv" "$d/mounts.next" || return 1
+      printf '%s\t%s\t%s\n' "$name" "$record" "$mode" >>"$d/mounts.next" || return 1 ;;
+    remove) awk -F '\t' -v n="$name" '$1 != n' "$d/mounts.tsv" >"$d/mounts.next" || return 1 ;;
+    *) return 1 ;;
+  esac
+  mv "$d/mounts.next" "$d/mounts.tsv" || return 1
+  hp_immich_override >"$d/override.next" && mv "$d/override.next" "$d/override.json" || return 1
+  if [[ $action == add && $mode == ro ]]; then
+    printf 'Read-only mount saved. Start/apply mounts, then add /external/%s in Immich Admin > External Libraries and scan. Immich cannot delete or modify originals through this mount.\n' "$name"
+  elif [[ $action == add ]]; then
+    printf 'Read-write mount saved. Start/apply mounts, then add /external/%s in Immich Admin > External Libraries and scan. Immich can permanently delete originals after trash is emptied.\n' "$name"
+  else
+    printf 'Mount configuration removed. Original files were not deleted. Start/apply mounts to update Immich.\n'
+  fi
+)
+
+hp_immich_start() (
+  set +x
+  hp_immich_preflight || return 1
+  local d; d=$(hp_immich_dir)
+  exec 9>"$d/operation.lock"; flock -n 9 || return 1
+  hp_immich_storage_guard || return 1
+  hp_immich_compose config --quiet >/dev/null 2>&1 || return 1
+  hp_immich_compose up -d --wait --wait-timeout 180 >/dev/null 2>&1 || { hp_immich_error 'Start failed or health timeout; inspect containers locally (logs can contain private data).'; return 1; }
+  hp_immich_status
+)
+hp_immich_status() { hp_immich_compose ps; }
+hp_immich_stop() { hp_immich_compose stop >/dev/null 2>&1; }
+hp_immich_supervise() {
+  hp_immich_start || return 1
+  # Keep systemd attached to the web/API container. Any unexpected exit makes
+  # this unit fail so Restart=on-failure reruns the guarded startup path.
+  docker wait immich_server >/dev/null || return 1
+  return 1
+}
+
+hp_immich_autostart() {
+  local action=$1 unit_dir unit
+  unit_dir=${HP_SYSTEMD_DIR:-/etc/systemd/system}
+  unit="$unit_dir/homephotos-immich.service"
+  case $action in
+    enable)
+      hp_immich_preflight || return 1
+      hp_immich_storage_guard || return 1
+      hp_install_self
+      mkdir -p "$unit_dir"
+      cat >"$unit" <<EOF
+[Unit]
+Description=HomePhotos guarded Immich startup and recovery
+Requires=docker.service
+After=docker.service network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$RESTIC_INSTALL_PATH immich-supervise
+ExecStop=$RESTIC_INSTALL_PATH immich-stop
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=10m
+StartLimitBurst=6
+TimeoutStartSec=240
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      chmod 0644 "$unit"
+      systemctl daemon-reload
+      systemctl enable --now homephotos-immich.service
+      note 'Immich guarded auto-start/recovery enabled. Storage UUID checks run before every start.'
+      ;;
+    disable)
+      systemctl disable --now homephotos-immich.service 2>/dev/null || true
+      rm -f -- "$unit"
+      systemctl daemon-reload
+      note 'Immich auto-start/recovery disabled. Immich containers were stopped; data was preserved.'
+      ;;
+    status)
+      if [[ -f $unit ]]; then
+        systemctl is-enabled homephotos-immich.service 2>/dev/null || true
+        systemctl status homephotos-immich.service --no-pager || true
+      else
+        printf 'Immich auto-start/recovery: disabled\n'
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+hp_immich_autostart_menu() {
+  while :; do
+    choose_menu 'Immich auto-start and failure recovery' 'Enable (start at boot and restart after failure)' 'Disable (stop Immich and remove boot start)' 'View status' 'Back'
+    case $MENU_INDEX in
+      0) hp_immich_autostart enable; press_enter_to_continue ;;
+      1) hp_immich_autostart disable; press_enter_to_continue ;;
+      2) hp_immich_autostart status; press_enter_to_continue ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+hp_immich_backup() (
+  set +x
+  set -o pipefail
+  umask 077
+  local d tmp dest
+  d=$(hp_immich_dir)
+  [[ -f $d/.env ]] || return 1
+  mkdir -p "$d/backups" || return 1
+  exec 9>"$d/operation.lock"; flock -n 9 || return 1
+  tmp=$(mktemp "$d/backups/.dump.XXXXXX") || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  hp_immich_compose exec -T database pg_dump --clean --if-exists --dbname=immich --username=postgres 2>/dev/null | gzip >"$tmp" || { hp_immich_error 'Database dump failed; partial file discarded.'; return 1; }
+  gzip -t "$tmp" || return 1
+  dest="$d/backups/immich-v3.2.2-$(date -u +%Y%m%dT%H%M%SZ)-${tmp##*.}.sql.gz"
+  mv "$tmp" "$dest" || return 1
+  printf 'Database-only backup: %s\nAlso back up media and external originals (database first, files second).\n' "$dest"
+)
+
+hp_immich_install() (
+  set +x
+  umask 077
+  hp_immich_preflight && hp_immich_storage_guard || return 1
+  local d tmp hash
+  d=$(hp_immich_dir)
+  exec 9>"$d/operation.lock"; flock -n 9 || return 1
+  tmp=$(mktemp "$d/.compose.XXXXXX") || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 https://github.com/immich-app/immich/releases/download/v3.2.2/docker-compose.yml -o "$tmp" || return 1
+  hash=$(sha256sum "$tmp"); hash=${hash%% *}
+  [[ $hash == fa98c3eb0884b0b88aaee11a9c9acb8cfb17a0f495d12c21358deb6d3e8a546b ]] || { hp_immich_error 'Official compose checksum mismatch; refusing installation.'; return 1; }
+  if [[ -e $d/docker-compose.yml ]]; then
+    cmp -s "$tmp" "$d/docker-compose.yml" || { hp_immich_error 'Existing compose differs; no automatic upgrade or overwrite.'; return 1; }
+  else
+    mv "$tmp" "$d/docker-compose.yml" || return 1
+  fi
+  hp_immich_compose config --quiet >/dev/null 2>&1 || return 1
+  hp_immich_compose pull >/dev/null 2>&1 || { hp_immich_error 'Image pull failed; nothing started.'; return 1; }
+  printf 'Official pinned v3.2.2 compose and images installed; choose Start explicitly. No automatic upgrades.\n'
+)
+
+hp_immich_configure_prompt() {
+  local media db media_default db_default
+  hp_immich_ensure_docker || { hp_immich_error 'Docker installation was cancelled or failed.'; return 1; }
+  hp_storage_load
+  media_default="$HP_STORAGE_MOUNT/immich"
+  db_default=${HP_IMMICH_DB_DEFAULT:-/var/lib/immich/postgres}
+  printf '%s\n' \
+    'Immich managed media (uploads, thumbnails and transcoded files) should be on the large storage drive.' \
+    'The PostgreSQL database should be on the local NVMe/system drive for fast random I/O.' \
+    'Existing photo libraries are added later as read-write external folders; do not use them here.'
+  ask 'Media directory (large storage drive)' "$media_default"; media=$REPLY
+  ask 'Database directory (local NVMe/system drive)' "$db_default"; db=$REPLY
+  hp_immich_valid_path "$media" && hp_immich_valid_path "$db" || {
+    hp_immich_error 'Use absolute paths with letters, digits, /, _, -, . only.'; return 1;
+  }
+  [[ ! -e $media || ( -d $media && ! -L $media ) ]] || { hp_immich_error 'Media path exists but is not a normal directory.'; return 1; }
+  [[ ! -e $db || ( -d $db && ! -L $db ) ]] || { hp_immich_error 'Database path exists but is not a normal directory.'; return 1; }
+  mkdir -p -- "$media" "$db" || { hp_immich_error 'Could not create the storage directories.'; return 1; }
+  chmod 700 -- "$media" "$db" || return 1
+  hp_immich_configure "$media" "$db"
+}
+
+hp_immich_menu() {
+  local name path
+  while :; do
+    choose_menu 'Immich (optional, pinned v3.2.2; no automatic upgrade)' 'Configure storage (one time)' 'Install Immich v3.2.2 compose/images' 'Status' 'Start / apply mounts' 'Stop (preserve everything)' 'Database backup' 'Add read-write external folder' 'Add read-only external folder' 'Config auto restart Immich' 'Remove external mount (not files)' 'List external mounts' 'Back'
+    case $MENU_INDEX in
+      0)
+        printf 'Docker Engine 25+ and Compose 2.24+ must already be installed using https://docs.docker.com/engine/install/debian/\n'
+        hp_immich_configure_prompt || printf 'Configuration failed.\n' ;;
+      1) hp_immich_install || printf 'Installation failed.\n' ;;
+      2) hp_immich_status || printf 'Not installed or Docker unavailable.\n' ;;
+      3)
+        choose_menu 'Starts Immich on TCP 2283 (all interfaces). Use trusted LAN/firewall, never port-forward. Continue?' 'Cancel' 'Start'
+        if [[ $MENU_INDEX == 1 ]]; then hp_immich_start || printf 'Start failed.\n'; fi ;;
+      4) hp_immich_stop || printf 'Stop failed.\n' ;;
+      5) hp_immich_backup || printf 'Backup failed.\n' ;;
+      6|7)
+        printf 'Mount name (lowercase): '; IFS= read -r name || return
+        printf 'Existing originals directory: '; IFS= read -r path || return
+        if [[ $MENU_INDEX == 6 ]]; then
+          hp_immich_mount add "$name" "$path" rw || printf 'Mount rejected.\n'
+        else
+          hp_immich_mount add "$name" "$path" ro || printf 'Mount rejected.\n'
+        fi ;;
+      8) hp_immich_autostart_menu ;;
+      9)
+        printf 'Mount name to remove: '; IFS= read -r name || return
+        hp_immich_mount remove "$name" || printf 'Mount removal failed.\n' ;;
+      10) hp_immich_mount list || printf 'Not configured.\n' ;;
+      *) return 0 ;;
+    esac
+    press_enter_to_continue
+  done
+}
+
+hp_immich_capabilities() {
+  local os=$1 version=$2 arch=$3 cores=$4 ram_kib=$5 flags=" $6 " flag
+  [[ $os == debian && $version =~ ^[0-9]+$ && $version -ge 11 ]] || return 1
+  [[ $cores =~ ^[0-9]+$ && $cores -ge 2 && $ram_kib =~ ^[0-9]+$ && $ram_kib -ge 6291456 ]] || return 1
+  case $arch in
+    aarch64|arm64) return 0 ;;
+    x86_64|amd64)
+      flags=${flags//pni/sse3}
+      for flag in sse3 ssse3 sse4_1 sse4_2 popcnt cx16 lahf_lm; do
+        [[ $flags == *" $flag "* ]] || return 1
+      done ;;
+    *) return 1 ;;
+  esac
+}
+
+
+# Restic v2 resource model. Server connections, remote storage, repositories,
+# and jobs are independent so one host can expose several disks/repositories.
+hp_restic_init() {
+  umask 077
+  mkdir -p "$RESTIC_SERVERS_DIR" "$RESTIC_STORAGES_DIR" "$RESTIC_REPOSITORIES_DIR" "$RESTIC_JOBS_DIR" "$RESTIC_LOCKS_DIR" "$RESTIC_ARCHIVE_DIR"
+  chmod 0700 "$RESTIC_CONTROLLER_DIR" "$RESTIC_SERVERS_DIR" "$RESTIC_STORAGES_DIR" "$RESTIC_REPOSITORIES_DIR" "$RESTIC_JOBS_DIR" "$RESTIC_LOCKS_DIR" "$RESTIC_ARCHIVE_DIR"
+}
+
+hp_resource_dir() {
+  valid_name "$2" || die "Invalid $1 id: $2"
+  case $1 in
+    server) printf '%s/%s' "$RESTIC_SERVERS_DIR" "$2";;
+    storage) printf '%s/%s' "$RESTIC_STORAGES_DIR" "$2";;
+    repository) printf '%s/%s' "$RESTIC_REPOSITORIES_DIR" "$2";;
+    job) printf '%s/%s' "$RESTIC_JOBS_DIR" "$2";;
+    *) die 'Unknown Restic resource type.';;
+  esac
+}
+
+write_controller_server_config() {
+  local dir; hp_restic_init; dir=$(hp_resource_dir server "$SERVER_ID")
+  mkdir -p "$dir"
+  { printf 'SERVER_ID=%q\nSERVER_LABEL=%q\nBACKUP_HOST=%q\nADMIN_USER=%q\n' "$SERVER_ID" "$SERVER_LABEL" "$BACKUP_HOST" "$ADMIN_USER"; } > "$dir/server.conf"
+  chmod 0600 "$dir/server.conf"
+}
+write_controller_storage_config() {
+  local dir; hp_restic_init; dir=$(hp_resource_dir storage "$STORAGE_ID"); mkdir -p "$dir"
+  { printf 'STORAGE_ID=%q\nSTORAGE_LABEL=%q\nSTORAGE_SERVER_ID=%q\nSTORAGE_KIND=%q\nSTORAGE_DEVICE=%q\nSTORAGE_UUID=%q\nREMOTE_MOUNTPOINT=%q\n' "$STORAGE_ID" "$STORAGE_LABEL" "$STORAGE_SERVER_ID" "$STORAGE_KIND" "$STORAGE_DEVICE" "$STORAGE_UUID" "$REMOTE_MOUNTPOINT"; } > "$dir/storage.conf"
+  chmod 0600 "$dir/storage.conf"
+}
+write_controller_repository_config() {
+  local dir; hp_restic_init; dir=$(hp_resource_dir repository "$REPOSITORY_ID"); mkdir -p "$dir"
+  { printf 'REPOSITORY_ID=%q\nREPOSITORY_LABEL=%q\nREPOSITORY_SERVER_ID=%q\nREPOSITORY_STORAGE_ID=%q\nSFTP_USER=%q\nREPOSITORY=%q\n' "$REPOSITORY_ID" "$REPOSITORY_LABEL" "$REPOSITORY_SERVER_ID" "$REPOSITORY_STORAGE_ID" "$SFTP_USER" "$REPOSITORY"; } > "$dir/repository.conf"
+  chmod 0600 "$dir/repository.conf"
+}
+write_controller_job_config() {
+  local dir path; hp_restic_init; dir=$(hp_resource_dir job "$JOB_ID"); mkdir -p "$dir"
+  { printf 'JOB_ID=%q\nJOB_LABEL=%q\nJOB_REPOSITORY_ID=%q\nBACKUP_TIME=%q\nMAINTENANCE_TIME=%q\nKEEP_DAILY=%q\nKEEP_WEEKLY=%q\nKEEP_MONTHLY=%q\nKEEP_YEARLY=%q\nCOMPRESSION=%q\nENABLED=%q\nSOURCE_PATHS=(' "$JOB_ID" "$JOB_LABEL" "$JOB_REPOSITORY_ID" "$BACKUP_TIME" "$MAINTENANCE_TIME" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_MONTHLY" "$KEEP_YEARLY" "$COMPRESSION" "$ENABLED"; for path in "${SOURCE_PATHS[@]}"; do printf ' %q' "$path"; done; printf ' )\n'; } > "$dir/job.conf"
+  chmod 0600 "$dir/job.conf"
+}
+load_controller_job() { SOURCE_PATHS=(); local d; d=$(hp_resource_dir job "$1"); [[ -f $d/job.conf ]] || die "Restic job not configured: $1"; . "$d/job.conf"; }
+load_controller_repository() { local d; d=$(hp_resource_dir repository "$1"); [[ -f $d/repository.conf ]] || die "Restic repository not configured: $1"; . "$d/repository.conf"; }
+load_controller_storage() { local d; d=$(hp_resource_dir storage "$1"); [[ -f $d/storage.conf ]] || die "Restic storage not configured: $1"; . "$d/storage.conf"; }
+
+hp_resolve_job() {
+  load_controller_job "$1"
+  hp_resolve_repository "$JOB_REPOSITORY_ID"
+}
+
+hp_resolve_repository() {
+  load_controller_repository "$1"
+  load_controller_storage "$REPOSITORY_STORAGE_ID"
+  [[ $STORAGE_SERVER_ID == "$REPOSITORY_SERVER_ID" ]] || die 'Repository server and storage server do not match.'
+  load_controller_server "$REPOSITORY_SERVER_ID"
+}
+
+hp_restic_secret_path() {
+  local id=$1 path
+  path="$RESTIC_REPOSITORIES_DIR/$id/repository-password.cred"
+  if [[ -f $path ]]; then printf '%s' "$path"; else printf '%s/repository-password.cred' "$(controller_server_dir "$id")"; fi
+}
+
+hp_resource_ids() { local f suffix=$2; for f in "$1"/*/"$suffix"; do [[ -f $f ]] && basename "$(dirname "$f")"; done | sort; }
+hp_job_ids() { hp_resource_ids "$RESTIC_JOBS_DIR" job.conf; }
+
+write_controller_jobs() {
+  local id=$1 unit_dir=${HP_SYSTEMD_DIR:-/etc/systemd/system} service timer maintenance_service maintenance_timer
+  load_controller_job "$id"; mkdir -p "$unit_dir" "$HOME_PHOTOS_DIR/cache/restic"
+  service="$unit_dir/homephotos-restic-job-${id}-backup.service"; timer="$unit_dir/homephotos-restic-job-${id}-backup.timer"
+  maintenance_service="$unit_dir/homephotos-restic-job-${id}-maintenance.service"; maintenance_timer="$unit_dir/homephotos-restic-job-${id}-maintenance.timer"
+  printf '[Unit]\nDescription=Restic job %s\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=%s restic-run %s\n' "$JOB_LABEL" "$RESTIC_INSTALL_PATH" "$id" > "$service"
+  printf '[Unit]\nDescription=Schedule Restic job %s\n[Timer]\nOnCalendar=*-*-* %s:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$JOB_LABEL" "$BACKUP_TIME" > "$timer"
+  printf '[Unit]\nDescription=Maintain Restic job %s\n[Service]\nType=oneshot\nExecStart=%s restic-maintenance %s\n' "$JOB_LABEL" "$RESTIC_INSTALL_PATH" "$id" > "$maintenance_service"
+  printf '[Unit]\nDescription=Schedule maintenance %s\n[Timer]\nOnCalendar=Sun *-*-* %s:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$JOB_LABEL" "$MAINTENANCE_TIME" > "$maintenance_timer"
+  chmod 0644 "$service" "$timer" "$maintenance_service" "$maintenance_timer"; systemctl daemon-reload
+  if [[ $ENABLED == yes ]]; then systemctl enable --now "homephotos-restic-job-${id}-backup.timer" "homephotos-restic-job-${id}-maintenance.timer"; else systemctl disable --now "homephotos-restic-job-${id}-backup.timer" "homephotos-restic-job-${id}-maintenance.timer" 2>/dev/null || true; fi
+}
+
+hp_migrate_legacy_profile() {
+  local id=$1 src="${HP_LEGACY_RESTIC_DIR:-/etc/photosync-restic-controller}/servers/$1" path
+  hp_restic_init; [[ -f $src/server.conf ]] || die "Legacy profile not found: $id"
+  # shellcheck disable=SC1090
+  . "$src/server.conf"
+  [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]] && return 0
+  write_controller_server_config
+  for path in admin-password.cred known_hosts; do [[ ! -f $src/$path ]] || cp -p "$src/$path" "$RESTIC_SERVERS_DIR/$id/$path"; done
+  STORAGE_ID=$id STORAGE_LABEL="$SERVER_LABEL storage" STORAGE_SERVER_ID=$id STORAGE_KIND=direct STORAGE_DEVICE=legacy STORAGE_UUID=legacy; write_controller_storage_config
+  REPOSITORY_ID=$id REPOSITORY_LABEL="$SERVER_LABEL repository" REPOSITORY_SERVER_ID=$id REPOSITORY_STORAGE_ID=$id; write_controller_repository_config
+  [[ ! -f $src/repository-password.cred ]] || cp -p "$src/repository-password.cred" "$RESTIC_REPOSITORIES_DIR/$id/repository-password.cred"
+  JOB_ID=$id JOB_LABEL="$SERVER_LABEL backup" JOB_REPOSITORY_ID=$id; write_controller_job_config
+  note "Legacy profile '$id' migrated idempotently; original files were preserved."
+}
+
+hp_dependents() { local dir=$1 key=$2 value=$3 f actual; for f in "$dir"/*/*.conf; do [[ -f $f ]] || continue; actual=$(bash -c ". \"$f\"; printf '%s' \"\${$key-}\""); [[ $actual == "$value" ]] && basename "$(dirname "$f")"; done; }
+hp_delete_job() { local id=$1 d; d=$(hp_resource_dir job "$id"); systemctl disable --now "homephotos-restic-job-${id}-backup.timer" "homephotos-restic-job-${id}-maintenance.timer" 2>/dev/null || true; rm -f "${HP_SYSTEMD_DIR:-/etc/systemd/system}"/homephotos-restic-job-"$id"-{backup,maintenance}.{service,timer}; [[ ! -e $d ]] || mv "$d" "$RESTIC_ARCHIVE_DIR/job-$id-$(date +%s)"; }
+hp_delete_repository() { local id=$1 deps d; deps=$(hp_dependents "$RESTIC_JOBS_DIR" JOB_REPOSITORY_ID "$id"); [[ -z $deps ]] || die "Repository is used by jobs: $deps"; d=$(hp_resource_dir repository "$id"); [[ ! -e $d ]] || mv "$d" "$RESTIC_ARCHIVE_DIR/repository-$id-$(date +%s)"; note 'Repository management removed; remote data preserved.'; }
+hp_delete_storage() { local id=$1 deps d; deps=$(hp_dependents "$RESTIC_REPOSITORIES_DIR" REPOSITORY_STORAGE_ID "$id"); [[ -z $deps ]] || die "Storage is used by repositories: $deps"; d=$(hp_resource_dir storage "$id"); [[ ! -e $d ]] || mv "$d" "$RESTIC_ARCHIVE_DIR/storage-$id-$(date +%s)"; note 'Storage registration removed; filesystem and data preserved.'; }
+hp_delete_server() { local id=$1 deps d; deps=$(hp_dependents "$RESTIC_STORAGES_DIR" STORAGE_SERVER_ID "$id"); deps+=$(hp_dependents "$RESTIC_REPOSITORIES_DIR" REPOSITORY_SERVER_ID "$id"); [[ -z $deps ]] || die "Server has dependent resources: $deps"; d=$(hp_resource_dir server "$id"); [[ ! -e $d ]] || mv "$d" "$RESTIC_ARCHIVE_DIR/server-$id-$(date +%s)"; }
+
+hp_remote_storage_direct_script() { cat <<'REMOTE'
+set -Eeuo pipefail
+root_source=$(findmnt -rn -o SOURCE /); root_chain=$(lsblk -s -nrpo NAME "$root_source")
+test -b "$DEVICE"; ! grep -Fxq "$DEVICE" <<< "$root_chain"
+[[ -z $(lsblk -nr -o MOUNTPOINT "$DEVICE" | tr -d '[:space:]') ]] || { echo 'Device is mounted/in use' >&2; exit 1; }
+if [[ $MODE == format ]]; then
+  [[ $CONFIRMATION == "TYPE THE EXACT WHOLE DISK $DEVICE" ]] || exit 1
+  [[ $(lsblk -dnro TYPE "$DEVICE") == disk ]] || exit 1
+  parted -s "$DEVICE" mklabel gpt; parted -s "$DEVICE" mkpart primary ext4 1MiB 100%; partprobe "$DEVICE"; udevadm settle
+  DEVICE=$(lsblk -nrpo NAME,PKNAME,TYPE | awk -v d="$DEVICE" '$2==d && $3=="part"{print $1;exit}'); mkfs.ext4 -F "$DEVICE"
+fi
+[[ $(blkid -s TYPE -o value "$DEVICE") == ext4 ]] || { echo 'Only direct ext4 storage is accepted' >&2; exit 1; }
+uuid=$(blkid -s UUID -o value "$DEVICE"); [[ -n $uuid ]]; mkdir -p "$MOUNTPOINT"
+grep -q "^UUID=$uuid " /etc/fstab || printf 'UUID=%s %s ext4 defaults,nofail,x-systemd.device-timeout=10s 0 2\n' "$uuid" "$MOUNTPOINT" >> /etc/fstab
+mount "$MOUNTPOINT"; [[ $(findmnt -rn -M "$MOUNTPOINT" -o UUID) == "$uuid" ]] || exit 1
+REMOTE
+}
+hp_remote_storage_lvm_script() { cat <<'REMOTE'
+echo 'LVM IS OPTIONAL and changes storage topology; use only after explicit review.' >&2
+[[ $LVM_CONFIRM == "CREATE LVM $VG/$LV ON $DEVICE" ]] || exit 1
+pvcreate "$DEVICE"; vgcreate "$VG" "$DEVICE"; lvcreate -l 100%FREE -n "$LV" "$VG"; mkfs.ext4 "/dev/$VG/$LV"
+REMOTE
+}
+
+add_controller_server() {
+  local dir admin_password
+  ensure_restic_controller; hp_restic_init
+  ask_name 'Server connection id' photo-backup; SERVER_ID=$REPLY
+  dir=$(hp_resource_dir server "$SERVER_ID"); [[ ! -e $dir ]] || die "Server connection already exists: $SERVER_ID"
+  ask 'Display label' 'Photo backup server'; SERVER_LABEL=$REPLY
+  ask_host 'Backup server IP address or hostname'; BACKUP_HOST=$REPLY
+  ask_name 'Administrator username' root; ADMIN_USER=$REPLY
+  ask_secret "Password for ${ADMIN_USER}@${BACKUP_HOST}"; admin_password=$REPLY
+  write_controller_server_config
+  encrypt_controller_secret "$dir/admin-password.cred" "homephotos-${SERVER_ID}-admin" "$admin_password"; unset admin_password
+  if ! pin_controller_host_key "$SERVER_ID"; then
+    rm -rf -- "$dir"; note 'Server addition cancelled before host-key trust was saved.'; return 1
+  fi
+  if ! remote_controller_exec "$SERVER_ID" 'set -Eeuo pipefail; printf "SSH administrator connection passed.\\n"'; then
+    rm -rf -- "$dir"; note 'Server connection test failed; local configuration was removed.'; return 1
+  fi
+  note 'Server connection saved and tested. No storage, repository, or job was created.'
+}
+
+hp_resource_label() {
+  local type=$1 id=$2
+  case $type in
+    server) load_controller_server "$id"; printf '%s — %s (%s)' "$SERVER_LABEL" "$BACKUP_HOST" "$id" ;;
+    storage) load_controller_storage "$id"; printf '%s — %s (%s)' "$STORAGE_LABEL" "$REMOTE_MOUNTPOINT" "$id" ;;
+    repository) load_controller_repository "$id"; printf '%s — %s (%s)' "$REPOSITORY_LABEL" "$REPOSITORY_SERVER_ID" "$id" ;;
+    job) load_controller_job "$id"; printf '%s — %s (%s)' "$JOB_LABEL" "$JOB_REPOSITORY_ID" "$id" ;;
+  esac
+}
+
+hp_select_resource() {
+  local type=$1 dir=$2 suffix=$3 prompt=$4 ids=() entries=() id
+  mapfile -t ids < <(hp_resource_ids "$dir" "$suffix")
+  ((${#ids[@]})) || { note "No Restic ${type}s are configured."; return 1; }
+  for id in "${ids[@]}"; do entries+=("$(hp_resource_label "$type" "$id")"); done
+  choose_menu "$prompt" "${entries[@]}" 'Cancel'
+  ((MENU_INDEX < ${#ids[@]})) || return 1
+  HP_SELECTED_RESOURCE=${ids[$MENU_INDEX]}
+}
+select_server() { hp_select_resource server "$RESTIC_SERVERS_DIR" server.conf 'Select server connection'; }
+select_storage() { hp_select_resource storage "$RESTIC_STORAGES_DIR" storage.conf 'Select remote storage'; }
+select_repository() { hp_select_resource repository "$RESTIC_REPOSITORIES_DIR" repository.conf 'Select repository'; }
+select_job() { hp_select_resource job "$RESTIC_JOBS_DIR" job.conf 'Select backup job'; }
+
+hp_test_server() { remote_controller_exec "$1" 'set -Eeuo pipefail; test "$(id -u)" -eq 0; printf "SSH administrator connection passed.\n"'; }
+hp_edit_server() {
+  local id=$1 dir password
+  load_controller_server "$id"; dir=$(hp_resource_dir server "$id")
+  ask 'Display label' "$SERVER_LABEL"; SERVER_LABEL=$REPLY
+  ask_host 'Backup server IP address or hostname' "$BACKUP_HOST"; BACKUP_HOST=$REPLY
+  ask_name 'Administrator username' "$ADMIN_USER"; ADMIN_USER=$REPLY
+  choose_menu 'Administrator credential' 'Keep current password' 'Replace password'
+  if ((MENU_INDEX == 1)); then ask_secret 'New administrator password'; password=$REPLY; encrypt_controller_secret "$dir/admin-password.cred" "homephotos-${id}-admin" "$password"; unset password; fi
+  write_controller_server_config; pin_controller_host_key "$id"; hp_test_server "$id"
+}
+
+hp_add_storage() {
+  local mode=$1 server script output
+  select_server || return; server=$HP_SELECTED_RESOURCE; load_controller_server "$server"
+  ask_name 'Storage id' backup-disk; STORAGE_ID=$REPLY
+  [[ ! -e $RESTIC_STORAGES_DIR/$STORAGE_ID ]] || die 'Storage id already exists.'
+  ask 'Storage label' 'Backup disk'; STORAGE_LABEL=$REPLY
+  ask_absolute_path 'Remote mount point' /mnt/photo-backup; REMOTE_MOUNTPOINT=$REPLY
+  ask 'Remote block device' /dev/sdb1; STORAGE_DEVICE=$REPLY
+  [[ $STORAGE_DEVICE =~ ^/dev/[A-Za-z0-9._/+:-]+$ ]] || die 'Invalid block device.'
+  STORAGE_SERVER_ID=$server; STORAGE_KIND=direct
+  case $mode in
+    existing) MODE=existing; CONFIRMATION= ;;
+    format) MODE=format; printf 'Type TYPE THE EXACT WHOLE DISK %s: ' "$STORAGE_DEVICE"; IFS= read -r CONFIRMATION; [[ $CONFIRMATION == "TYPE THE EXACT WHOLE DISK $STORAGE_DEVICE" ]] || die 'Confirmation did not match.' ;;
+    lvm)
+      ask_name 'Volume group' photo_backup; VG=$REPLY; ask_name 'Logical volume' restic; LV=$REPLY
+      printf 'Type CREATE LVM %s/%s ON %s: ' "$VG" "$LV" "$STORAGE_DEVICE"; IFS= read -r LVM_CONFIRM
+      script=$(printf 'DEVICE=%q\nVG=%q\nLV=%q\nLVM_CONFIRM=%q\n' "$STORAGE_DEVICE" "$VG" "$LV" "$LVM_CONFIRM"); script+=$'\n'; script+=$(hp_remote_storage_lvm_script)
+      remote_controller_exec "$server" "$script"; STORAGE_DEVICE="/dev/$VG/$LV"; MODE=existing; STORAGE_KIND=lvm ;;
+  esac
+  script=$(printf 'DEVICE=%q\nMOUNTPOINT=%q\nMODE=%q\nCONFIRMATION=%q\n' "$STORAGE_DEVICE" "$REMOTE_MOUNTPOINT" "$MODE" "${CONFIRMATION:-}"); script+=$'\n'; script+=$(hp_remote_storage_direct_script)
+  output=$(remote_controller_exec "$server" "$script"; remote_controller_exec "$server" "blkid -s UUID -o value '$STORAGE_DEVICE'")
+  STORAGE_UUID=${output##*$'\n'}; [[ -n $STORAGE_UUID ]] || die 'Remote filesystem UUID was not returned.'
+  write_controller_storage_config
+}
+hp_verify_storage() {
+  local id=$1 script
+  load_controller_storage "$id"
+  script=$(printf 'MOUNTPOINT=%q\nEXPECTED=%q\n' "$REMOTE_MOUNTPOINT" "$STORAGE_UUID")
+  script+=$'actual=$(findmnt -rn -M "$MOUNTPOINT" -o UUID); [[ -n $actual && $actual == "$EXPECTED" ]]\nprintf "Storage UUID verified: %s\\n" "$actual"\n'
+  remote_controller_exec "$STORAGE_SERVER_ID" "$script"
+}
+
+hp_add_repository() {
+  local password dir
+  select_server || return; REPOSITORY_SERVER_ID=$HP_SELECTED_RESOURCE
+  select_storage || return; REPOSITORY_STORAGE_ID=$HP_SELECTED_RESOURCE
+  load_controller_storage "$REPOSITORY_STORAGE_ID"; [[ $STORAGE_SERVER_ID == "$REPOSITORY_SERVER_ID" ]] || die 'Storage belongs to a different server.'
+  ask_name 'Repository id' family; REPOSITORY_ID=$REPLY; [[ ! -e $RESTIC_REPOSITORIES_DIR/$REPOSITORY_ID ]] || die 'Repository id already exists.'
+  ask 'Repository label' 'Family photos'; REPOSITORY_LABEL=$REPLY; ask_name 'Restricted SFTP username' "restic_$REPOSITORY_ID"; SFTP_USER=$REPLY; ask_name 'Repository directory' "$REPOSITORY_ID"; REPOSITORY=$REPLY
+  write_controller_repository_config; dir=$(hp_resource_dir repository "$REPOSITORY_ID")
+  choose_menu 'Repository encryption password' 'Generate strong password' 'Enter password'
+  if ((MENU_INDEX == 0)); then password=$(openssl rand -base64 36 | tr -d '\n'); else ask_secret 'Repository encryption password'; password=$REPLY; fi
+  encrypt_controller_secret "$dir/repository-password.cred" "homephotos-${REPOSITORY_ID}-repository" "$password"; unset password
+  if ! provision_controller_server "$REPOSITORY_ID" || ! restic_controller_command "$REPOSITORY_ID" init; then
+    rm -rf -- "$dir"; note 'Repository setup failed; local repository configuration was removed.'; return 1
+  fi
+}
+hp_test_repository() { restic_controller_command "$1" dry-run; }
+
+hp_prompt_job_fields() {
+  local source_input current=''
+  [[ ${SOURCE_PATHS+x} ]] && current=$(source_paths_display)
+  ask 'Job label' "${JOB_LABEL:-Photo backup}"; JOB_LABEL=$REPLY
+  ask 'Source paths, comma-separated' "${current:-/mnt/photos}"; source_input=$REPLY; parse_source_paths "$source_input"
+  ask_backup_time 'Daily backup time' "${BACKUP_TIME:-02:30}"; BACKUP_TIME=$REPLY; ask_backup_time 'Sunday maintenance time' "${MAINTENANCE_TIME:-03:30}"; MAINTENANCE_TIME=$REPLY
+  ask_nonnegative_integer 'Daily snapshots' "${KEEP_DAILY:-7}"; KEEP_DAILY=$REPLY; ask_nonnegative_integer 'Weekly snapshots' "${KEEP_WEEKLY:-4}"; KEEP_WEEKLY=$REPLY
+  ask_nonnegative_integer 'Monthly snapshots' "${KEEP_MONTHLY:-6}"; KEEP_MONTHLY=$REPLY; ask_nonnegative_integer 'Yearly snapshots' "${KEEP_YEARLY:-1}"; KEEP_YEARLY=$REPLY
+  choose_menu 'Compression' 'Automatic' 'Maximum' 'Off'; case $MENU_INDEX in 0) COMPRESSION=auto;; 1) COMPRESSION=max;; *) COMPRESSION=off;; esac
+  choose_menu 'Schedule' 'Enable' 'Disable'; ((MENU_INDEX == 0)) && ENABLED=yes || ENABLED=no
+}
+hp_add_job() { select_repository || return; JOB_REPOSITORY_ID=$HP_SELECTED_RESOURCE; ask_name 'Job id' nightly; JOB_ID=$REPLY; [[ ! -e $RESTIC_JOBS_DIR/$JOB_ID ]] || die 'Job id already exists.'; SOURCE_PATHS=(); hp_prompt_job_fields; write_controller_job_config; write_controller_jobs "$JOB_ID"; }
+hp_edit_job() { local id=$1; load_controller_job "$id"; hp_prompt_job_fields; write_controller_job_config; write_controller_jobs "$id"; }
+
+dry_run_controller_server() {
+  local id=$1 path unit
+  if [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]]; then
+    hp_resolve_job "$id"; hp_verify_storage "$REPOSITORY_STORAGE_ID"
+    for path in "${SOURCE_PATHS[@]}"; do [[ -d $path ]] || die "Backup source does not exist: $path"; done
+    for unit in homephotos-restic-job-${id}-{backup,maintenance}.{service,timer}; do systemctl cat "$unit" >/dev/null || die "Installed systemd unit is missing: $unit"; done
+    restic_controller_command "$id" dry-run
+  else
+    load_controller_server "$id"; hp_test_server "$id"; restic_controller_command "$id" dry-run
+  fi
+}
+
+hp_dry_run_all_jobs() { local id; while IFS= read -r id; do [[ -z $id ]] || dry_run_controller_server "$id"; done < <(hp_job_ids); }
+
+hp_remote_block_inventory() {
+  local server=$1 marker=$2 script
+  script=$(printf '# %s\nMARKER=%q\n' "$marker" "$marker")
+  script+=$'\n'
+  script+=$'set -Eeuo pipefail\n'
+  script+=$(cat <<'REMOTE_INVENTORY'
+root_source=$(findmnt -rn -o SOURCE /)
+root_disk=$(lsblk -s -nrpo NAME,TYPE "$root_source" | awk '$2 == "disk" { print $1; exit }')
+while IFS= read -r line; do
+  [[ $line =~ (^|[[:space:]])PATH=\"([^\"]*)\" ]] || continue
+  path=${BASH_REMATCH[2]}
+  [[ $line =~ (^|[[:space:]])TYPE=\"([^\"]*)\" ]] || continue
+  type=${BASH_REMATCH[2]}
+  case "$path:$type" in /dev/zram*:*|*:loop|*:rom|*:zram) continue;; esac
+  if [[ -n $root_disk ]] && lsblk -s -nrpo NAME "$path" 2>/dev/null | grep -Fxq "$root_disk"; then
+    continue
+  fi
+  if [[ $MARKER == HP_FORMAT_DISCOVERY ]]; then
+    # Formatting is explicitly destructive. List every real whole disk except
+    # the disk backing /, including disks with mounted partitions/filesystems.
+    [[ $type == disk ]] || continue
+  elif [[ $MARKER == HP_WHOLE_DISCOVERY ]]; then
+    # LVM creation still requires a genuinely unused whole disk.
+    [[ $type == disk ]] || continue
+    [[ $(lsblk -nrpo TYPE "$path" | wc -l) -eq 1 ]] || continue
+    [[ -z $(blkid "$path" 2>/dev/null) ]] || continue
+  fi
+  printf '%s\n' "$line"
+done < <(lsblk -b -p -P -o PATH,TYPE,SIZE,MODEL,SERIAL,FSTYPE,MOUNTPOINT,UUID) | awk '
+function value(key, line,    pattern,start,rest,end) {
+  pattern=key "=\""; start=index(line,pattern); if (!start) return "";
+  rest=substr(line,start+length(pattern)); end=index(rest,"\""); return substr(rest,1,end-1)
+}
+{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", value("PATH",$0),value("TYPE",$0),value("SIZE",$0),value("MODEL",$0),value("SERIAL",$0),value("FSTYPE",$0),value("MOUNTPOINT",$0),value("UUID",$0) }'
+REMOTE_INVENTORY
+)
+  remote_controller_exec "$server" "$script"
+}
+
+hp_human_size() {
+  local bytes=$1
+  if [[ $bytes =~ ^[0-9]+$ ]]; then numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || printf '%sB' "$bytes"; else printf '%s' "$bytes"; fi
+}
+
+hp_list_remote_drives() {
+  local server=$1 path type size model serial fstype mountpoint uuid
+  printf 'Device\tType\tSize\tModel\tSerial\tFilesystem\tMount\tUUID\n'
+  while IFS=$'\t' read -r path type size model serial fstype mountpoint uuid; do
+    [[ -n $path ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$path" "$type" "$(hp_human_size "$size")" "${model:--}" "${serial:--}" "${fstype:--}" "${mountpoint:--}" "${uuid:--}"
+  done < <(hp_remote_block_inventory "$server" HP_DRIVE_DISCOVERY)
+}
+
+hp_select_remote_block() {
+  local server=$1 purpose=$2 line path type size model serial fstype mountpoint uuid marker=HP_DRIVE_DISCOVERY
+  local paths=() types=() sizes=() models=() serials=() fstypes=() mounts=() uuids=() entries=()
+  [[ $purpose != format ]] || marker=HP_FORMAT_DISCOVERY
+  [[ $purpose != whole ]] || marker=HP_WHOLE_DISCOVERY
+  [[ $purpose != filesystem ]] || marker=HP_PARTITION_DISCOVERY
+  [[ $purpose != lvm ]] || marker=HP_LVM_DISCOVERY
+  [[ $purpose != mounted ]] || marker=HP_MOUNTED_DISCOVERY
+  while IFS= read -r line; do
+    IFS='|' read -r path type size model serial fstype mountpoint uuid <<< "${line//$'\t'/|}"
+    [[ -n $path ]] || continue
+    case $purpose in
+      format) [[ $type == disk && -z $fstype && -z $mountpoint ]] || continue;;
+      filesystem) [[ ( $type == part || $type == lvm ) && -n $fstype ]] || continue;;
+      lvm) [[ $type == lvm ]] || continue;;
+      whole) [[ $type == disk && -z $fstype && -z $mountpoint ]] || continue;;
+      mounted) [[ -n $fstype && $mountpoint == /* && $mountpoint != / ]] || continue;;
+    esac
+    paths+=("$path"); types+=("$type"); sizes+=("$size"); models+=("$model"); serials+=("$serial"); fstypes+=("$fstype"); mounts+=("$mountpoint"); uuids+=("$uuid")
+    entries+=("$path — $(hp_human_size "$size") — ${model:--} — serial ${serial:--} — ${fstype:-unused whole drive}${mountpoint:+ — mounted $mountpoint}${uuid:+ — UUID $uuid}")
+  done < <(hp_remote_block_inventory "$server" "$marker")
+  ((${#paths[@]})) || { note "No eligible remote $purpose devices found."; return 1; }
+  choose_menu "Select remote $purpose device" "${entries[@]}" 'Cancel'
+  ((MENU_INDEX < ${#paths[@]})) || return 1
+  HP_SELECTED_DEVICE=${paths[$MENU_INDEX]}; HP_SELECTED_TYPE=${types[$MENU_INDEX]}; HP_SELECTED_FSTYPE=${fstypes[$MENU_INDEX]}; HP_SELECTED_MOUNT=${mounts[$MENU_INDEX]}; HP_SELECTED_UUID=${uuids[$MENU_INDEX]}
+}
+
+hp_confirm_exact_device() {
+  local device=$1 answer
+  printf 'Type the exact device path %s to continue: ' "$device"
+  IFS= read -r answer
+  [[ $answer == "$device" ]] || { note 'Exact device confirmation did not match.'; return 1; }
+}
+
+hp_remote_format_script() { cat <<'REMOTE'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+missing_packages=()
+command -v parted >/dev/null 2>&1 || missing_packages+=(parted)
+command -v partprobe >/dev/null 2>&1 || missing_packages+=(parted)
+command -v mkfs.ext4 >/dev/null 2>&1 || missing_packages+=(e2fsprogs)
+command -v fuser >/dev/null 2>&1 || missing_packages+=(psmisc)
+if ((${#missing_packages[@]})); then
+  command -v apt-get >/dev/null 2>&1 || { printf 'Missing required packages: %s. apt-get is unavailable on the remote server.\n' "${missing_packages[*]}" >&2; exit 1; }
+  apt-get update
+  apt-get install -y "${missing_packages[@]}"
+fi
+[[ $DEVICE == "$CONFIRM_DEVICE" && $DEVICE == /dev/* ]]
+[[ $(lsblk -dnro TYPE "$DEVICE") == disk ]]
+root_source=$(findmnt -rn -o SOURCE /); root_chain=$(lsblk -s -nrpo NAME "$root_source")
+! grep -Fxq "$DEVICE" <<< "$root_chain"
+# Reinitialization is allowed for a confirmed non-root disk, including mounted
+# partitions. Stop users and unmount every descendant before wiping signatures.
+mapfile -t mounted_points < <(lsblk -nrpo MOUNTPOINT "$DEVICE" | awk 'NF && $1 != "/" {print length($1) "\t" $1}' | sort -rn | cut -f2-)
+for mountpoint in "${mounted_points[@]}"; do
+  [[ -n $mountpoint && $mountpoint != / ]] || continue
+  fuser -km -- "$mountpoint" 2>/dev/null || true
+  umount -- "$mountpoint" 2>/dev/null || umount -l -- "$mountpoint"
+done
+[[ -z $(lsblk -nr -o MOUNTPOINTS "$DEVICE" | tr -d '[:space:]') ]]
+wipefs -a "$DEVICE"
+parted -s "$DEVICE" mklabel gpt
+parted -s "$DEVICE" mkpart primary ext4 1MiB 100%
+partprobe "$DEVICE"; udevadm settle
+partition=''
+for attempt in 1 2 3 4 5; do
+  partition=$(lsblk -nrpo PATH,PKNAME,TYPE | awk -v d="$DEVICE" '$2==d && $3=="part" {print $1; exit}')
+  [[ -n $partition && -b $partition ]] && break
+  udevadm settle; sleep 1
+done
+[[ -n $partition && -b $partition ]] || { printf 'The new partition did not appear for %s.\n' "$DEVICE" >&2; exit 1; }
+mkfs.ext4 -F "$partition"
+uuid=$(blkid -s UUID -o value "$partition")
+[[ -n $uuid ]] || { printf 'The new ext4 filesystem has no UUID.\n' >&2; exit 1; }
+printf 'Created ext4 partition %s UUID %s\n' "$partition" "$uuid"
+REMOTE
+}
+
+hp_format_remote_drive() {
+  local server=$1 script
+  hp_select_remote_block "$server" format || return
+  confirm 'Format and create ext4 partition on this drive?' || return
+  hp_confirm_exact_device "$HP_SELECTED_DEVICE" || return
+  confirm "FINAL WARNING: unmount and permanently erase all data on $HP_SELECTED_DEVICE?" || return
+  script=$(printf 'DEVICE=%q\nCONFIRM_DEVICE=%q\n' "$HP_SELECTED_DEVICE" "$HP_SELECTED_DEVICE"); script+=$'\n'; script+=$(hp_remote_format_script)
+  remote_controller_exec "$server" "$script"
+}
+
+hp_remote_mount_script() { cat <<'REMOTE'
+set -Eeuo pipefail
+[[ $DEVICE == /dev/* && $MOUNTPOINT == /* && $MOUNTPOINT != / && $MOUNTPOINT != *..* ]]
+test -b "$DEVICE"
+uuid=$(blkid -s UUID -o value "$DEVICE"); fstype=$(blkid -s TYPE -o value "$DEVICE")
+[[ -n $uuid && -n $fstype ]]
+mkdir -p "$MOUNTPOINT"; exec 9>/etc/fstab.homephotos.lock; flock -x 9
+tmp=$(mktemp /etc/fstab.homephotos.XXXXXX); trap 'rm -f "$tmp"' EXIT
+cp -p /etc/fstab "$tmp"
+awk -v u="UUID=$uuid" -v m="$MOUNTPOINT" '$1 != u && $2 != m {print}' /etc/fstab > "$tmp"
+printf 'UUID=%s %s %s defaults,nofail,x-systemd.device-timeout=10s 0 2\n' "$uuid" "$MOUNTPOINT" "$fstype" >> "$tmp"
+mountpoint -q "$MOUNTPOINT" && umount "$MOUNTPOINT"
+install -m 0644 "$tmp" /etc/fstab; systemctl daemon-reload; mount "$MOUNTPOINT"
+actual=$(findmnt -rn -M "$MOUNTPOINT" -o UUID); [[ $actual == "$uuid" ]]
+printf 'HP_MOUNT_RESULT\t%s\t%s\t%s\n' "$uuid" "$DEVICE" "$MOUNTPOINT"
+REMOTE
+}
+
+hp_register_storage_result() {
+  local server=$1 kind=$2 device=$3 uuid=$4 mountpoint=$5
+  ask_name 'Storage id' backup-storage; STORAGE_ID=$REPLY
+  [[ ! -e $RESTIC_STORAGES_DIR/$STORAGE_ID ]] || die "Storage id already exists: $STORAGE_ID"
+  ask 'Storage label' 'Restic storage'; STORAGE_LABEL=$REPLY
+  STORAGE_SERVER_ID=$server STORAGE_KIND=$kind STORAGE_DEVICE=$device STORAGE_UUID=$uuid REMOTE_MOUNTPOINT=$mountpoint
+  write_controller_storage_config
+}
+
+hp_mount_and_register_device() {
+  local server=$1 kind=$2 device=$3 default_mount=${4:-/mnt/restic} script line uuid mounted_device mountpoint
+  ask_absolute_path 'Desired absolute mount point' "$default_mount"; mountpoint=$REPLY
+  script=$(printf 'DEVICE=%q\nMOUNTPOINT=%q\n' "$device" "$mountpoint"); script+=$'\n'; script+=$(hp_remote_mount_script)
+  uuid=; mounted_device=
+  while IFS= read -r line; do
+    [[ $line == HP_MOUNT_RESULT$'\t'* ]] && IFS=$'\t' read -r _ uuid mounted_device mountpoint <<< "$line"
+  done < <(remote_controller_exec "$server" "$script")
+  [[ -n $uuid && $mounted_device == "$device" && -n $mountpoint ]] || die 'Remote mount completed without verified UUID result.'
+  hp_register_storage_result "$server" "$kind" "$mounted_device" "$uuid" "$mountpoint"
+}
+
+hp_mount_remote_partition() {
+  local server=$1 kind=direct
+  hp_select_remote_block "$server" filesystem || return
+  [[ $HP_SELECTED_TYPE != lvm ]] || kind=lvm
+  hp_mount_and_register_device "$server" "$kind" "$HP_SELECTED_DEVICE"
+}
+
+hp_remote_format_lvm_script() { cat <<'REMOTE'
+set -Eeuo pipefail
+[[ $DEVICE == "$CONFIRM_DEVICE" && $DEVICE == /dev/* ]]
+[[ $(lsblk -dnro TYPE "$DEVICE") == lvm ]]
+[[ -z $(lsblk -dnro FSTYPE "$DEVICE") ]]
+[[ -z $(findmnt -rn -S "$DEVICE") ]]
+mkfs.ext4 -F "$DEVICE"
+uuid=$(blkid -s UUID -o value "$DEVICE")
+[[ -n $uuid ]]
+printf 'HP_LVM_FORMAT_RESULT\t%s\t%s\n' "$uuid" "$DEVICE"
+REMOTE
+}
+
+hp_register_lvm_storage() {
+  local server=$1 script line uuid formatted_device
+  hp_select_remote_block "$server" lvm || return
+  if [[ -z $HP_SELECTED_FSTYPE ]]; then
+    choose_menu 'Format selected LVM logical volume as ext4?' 'Format as ext4' 'Cancel'
+    ((MENU_INDEX == 0)) || return
+    hp_confirm_exact_device "$HP_SELECTED_DEVICE" || return
+    script=$(printf 'DEVICE=%q\nCONFIRM_DEVICE=%q\n' "$HP_SELECTED_DEVICE" "$HP_SELECTED_DEVICE"); script+=$'\n'; script+=$(hp_remote_format_lvm_script)
+    while IFS= read -r line; do
+      [[ $line == HP_LVM_FORMAT_RESULT$'\t'* ]] && IFS=$'\t' read -r _ uuid formatted_device <<< "$line"
+    done < <(remote_controller_exec "$server" "$script")
+    [[ -n $uuid && $formatted_device == "$HP_SELECTED_DEVICE" ]] || die 'LVM format completed without a verified UUID.'
+  fi
+  hp_mount_and_register_device "$server" lvm "$HP_SELECTED_DEVICE" /mnt/restic-lvm
+}
+
+hp_select_multiple_remote_blocks() {
+  local server=$1 purpose=$2 minimum=$3 selected=() selected_mounts=() device
+  while :; do
+    hp_select_remote_block "$server" "$purpose" || break
+    device=$HP_SELECTED_DEVICE
+    if [[ " ${selected[*]} " == *" $device "* ]]; then note "$device is already selected."; continue; fi
+    selected+=("$device"); selected_mounts+=("${HP_SELECTED_MOUNT:-}")
+    choose_menu "Selected: ${selected[*]}" 'Add another' 'Finish selection'
+    ((MENU_INDEX == 0)) || break
+  done
+  ((${#selected[@]} >= minimum)) || { note "Select at least $minimum devices."; return 1; }
+  HP_SELECTED_DEVICES=("${selected[@]}"); HP_SELECTED_MOUNTS=("${selected_mounts[@]}")
+}
+
+hp_confirm_phrase() {
+  local prompt=$1 expected=$2 answer
+  printf '%s\nType exactly: %s\n> ' "$prompt" "$expected"; IFS= read -r answer
+  [[ $answer == "$expected" ]] || { note 'Confirmation did not match.'; return 1; }
+}
+
+hp_create_remote_lvm() {
+  local server=$1 vg lv phrase script quoted_devices
+  hp_select_multiple_remote_blocks "$server" whole 2 || return
+  ask_name 'LVM volume group' photos_vg; vg=$REPLY
+  ask_name 'LVM logical volume' restic; lv=$REPLY
+  phrase="CREATE LVM $vg/$lv ON ${HP_SELECTED_DEVICES[*]}"
+  hp_confirm_phrase 'This erases every selected whole drive.' "$phrase" || return
+  printf -v quoted_devices ' %q' "${HP_SELECTED_DEVICES[@]}"
+  script=$(printf 'VG=%q\nLV=%q\nEXPECTED=%q\nCONFIRMATION=%q\nDEVICES=(%s )\n' "$vg" "$lv" "$phrase" "$phrase" "$quoted_devices"); script+=$'\n'
+  script+=$'set -Eeuo pipefail\n[[ $CONFIRMATION == "$EXPECTED" && ${#DEVICES[@]} -ge 2 ]]\nroot_source=$(findmnt -rn -o SOURCE /); root_chain=$(lsblk -s -nrpo NAME "$root_source")\nfor d in "${DEVICES[@]}"; do [[ $d == /dev/* && $(lsblk -dnro TYPE "$d") == disk ]]; ! grep -Fxq "$d" <<< "$root_chain"; [[ -z $(lsblk -nr -o MOUNTPOINT "$d" | tr -d "[:space:]") ]]; done\napt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y lvm2 e2fsprogs\n'
+  script+="pvcreate --$quoted_devices"$'\n'
+  script+="vgcreate -- $(printf '%q' "$vg")$quoted_devices"$'\n'
+  script+=$(printf 'lvcreate -l 100%%FREE -n %q %q\nmkfs.ext4 -F %q\n' "$lv" "$vg" "/dev/$vg/$lv")
+  remote_controller_exec "$server" "$script" || return
+  choose_menu 'LVM logical volume created and formatted.' 'Set mount point and register for Restic' 'Return without registering'
+  ((MENU_INDEX == 0)) && hp_mount_and_register_device "$server" lvm "/dev/$vg/$lv" /mnt/restic-lvm
+}
+
+hp_select_mergerfs_sources() {
+  local server=$1 device mountpoint script line uuid mounted_device source_count=0
+  local source_devices=() source_mounts=()
+  while :; do
+    hp_select_remote_block "$server" filesystem || return 1
+    device=$HP_SELECTED_DEVICE; mountpoint=$HP_SELECTED_MOUNT
+    if [[ " ${source_devices[*]} " == *" $device "* ]]; then note "$device is already selected."; continue; fi
+    if [[ -z $mountpoint ]]; then
+      ask_absolute_path "Mount point for $device" "/mnt/restic-source-$source_count"; mountpoint=$REPLY
+      script=$(printf 'DEVICE=%q\nMOUNTPOINT=%q\n' "$device" "$mountpoint"); script+=$'\n'; script+=$(hp_remote_mount_script)
+      uuid=; mounted_device=
+      while IFS= read -r line; do
+        [[ $line == HP_MOUNT_RESULT$'\t'* ]] && IFS=$'\t' read -r _ uuid mounted_device mountpoint <<< "$line"
+      done < <(remote_controller_exec "$server" "$script")
+      [[ -n $uuid && $mounted_device == "$device" && -n $mountpoint ]] || die "Could not mount and verify mergerfs source $device."
+    fi
+    source_devices+=("$device"); source_mounts+=("$mountpoint"); source_count=$((source_count + 1))
+    choose_menu "Selected mergerfs sources ($source_count): ${source_mounts[*]}" 'Add another' 'Finish selection'
+    ((MENU_INDEX == 0)) || break
+  done
+  ((source_count >= 2)) || { note "Select at least 2 filesystems for mergerfs (selected: $source_count)."; return 1; }
+  HP_SELECTED_DEVICES=("${source_devices[@]}"); HP_SELECTED_MOUNTS=("${source_mounts[@]}")
+}
+
+hp_remote_mergerfs_script() { cat <<'REMOTE'
+set -Eeuo pipefail
+[[ $CONFIRMATION == "$EXPECTED" && $SOURCES == *:* && $POOL == /* && $POOL != / ]]
+echo 'mergerfs does not make one Restic repository failure-independent' >&2
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y mergerfs
+mkdir -p "$POOL"
+exec 9>/etc/fstab.homephotos.lock
+flock -x 9
+tmp=$(mktemp /etc/fstab.homephotos.XXXXXX)
+trap 'rm -f "$tmp"' EXIT
+awk -v m="$POOL" '$2 != m {print}' /etc/fstab > "$tmp"
+printf '%s %s fuse.mergerfs defaults,nofail,allow_other,use_ino,category.create=mfs 0 0\n' "$SOURCES" "$POOL" >> "$tmp"
+install -m 0644 "$tmp" /etc/fstab
+systemctl daemon-reload
+mount "$POOL"
+findmnt -rn -M "$POOL" >/dev/null
+REMOTE
+}
+
+hp_create_remote_mergerfs() {
+  local server=$1 pool sources phrase script
+  hp_select_mergerfs_sources "$server" || return
+  ask_absolute_path 'mergerfs pool absolute mount point' /mnt/restic-pool; pool=$REPLY
+  sources=$(IFS=:; printf '%s' "${HP_SELECTED_MOUNTS[*]}")
+  phrase="CREATE MERGERFS $pool FROM $sources"
+  hp_confirm_phrase 'mergerfs does not make one Restic repository failure-independent; loss of a source can damage that repository.' "$phrase" || return
+  script=$(printf 'SOURCES=%q\nPOOL=%q\nEXPECTED=%q\nCONFIRMATION=%q\n' "$sources" "$pool" "$phrase" "$phrase")
+  script+=$'\n'; script+=$(hp_remote_mergerfs_script)
+  remote_controller_exec "$server" "$script"
+}
+
+hp_register_existing_mergerfs() {
+  local server=$1 pool line kind mountpoint identity script
+  ask_absolute_path 'Existing mergerfs pool mount point' /mnt/restic-pool; pool=$REPLY
+  script=$(printf 'POOL=%q\n' "$pool"); script+=$'\n'
+  script+=$'set -Eeuo pipefail\n[[ $POOL == /* && $POOL != / ]]\nfindmnt -rn -M "$POOL" -t fuse.mergerfs >/dev/null\nsources=$(findmnt -rn -M "$POOL" -o SOURCE)\n[[ $sources == *:* ]]\nprintf "HP_POOL_RESULT\\tmergerfs\\t%s\\t%s\\n" "$POOL" "$sources"\n'
+  while IFS= read -r line; do
+    [[ $line == HP_POOL_RESULT$'\t'* ]] && IFS=$'\t' read -r _ kind mountpoint identity <<< "$line"
+  done < <(remote_controller_exec "$server" "$script")
+  [[ $kind == mergerfs && -n $identity ]] || die 'Remote mergerfs pool verification failed.'
+  hp_register_storage_result "$server" mergerfs "$identity" "mergerfs:$identity" "$mountpoint"
+}
+
+hp_mount_remote_merged_storage() {
+  local server=$1
+  choose_menu 'Register merged storage type' 'LVM logical volume' 'mergerfs pool' 'Cancel'
+  case $MENU_INDEX in
+    0) hp_mount_remote_partition "$server";;
+    1) hp_register_existing_mergerfs "$server";;
+    *) return;;
+  esac
+}
+
+hp_add_storage_registration() {
+  local server
+  select_server || return; server=$HP_SELECTED_RESOURCE
+  choose_menu 'Register Restic backup storage type' 'Direct partition' 'LVM logical volume' 'Existing mergerfs pool' 'Cancel'
+  case $MENU_INDEX in
+    0) hp_mount_remote_partition "$server";;
+    1) hp_register_lvm_storage "$server";;
+    2) hp_register_existing_mergerfs "$server";;
+    *) return;;
+  esac
+}
+hp_update_storage_registration() {
+  local id=$1
+  load_controller_storage "$id"
+  ask 'Storage label' "$STORAGE_LABEL"; STORAGE_LABEL=$REPLY
+  ask_absolute_path 'Registered mount point' "$REMOTE_MOUNTPOINT"; REMOTE_MOUNTPOINT=$REPLY
+  write_controller_storage_config
+}
+hp_storage_registration_label() {
+  load_controller_storage "$1"
+  printf '%s — server %s — %s — %s — UUID %s — %s (%s)' "$STORAGE_LABEL" "$STORAGE_SERVER_ID" "$STORAGE_KIND" "$STORAGE_DEVICE" "$STORAGE_UUID" "$REMOTE_MOUNTPOINT" "$STORAGE_ID"
+}
+hp_restic_storage_registrations_menu() {
+  local id ids=() labels=()
+  while :; do
+    mapfile -t ids < <(hp_resource_ids "$RESTIC_STORAGES_DIR" storage.conf); labels=()
+    for id in "${ids[@]}"; do labels+=("$(hp_storage_registration_label "$id")"); done
+    choose_menu 'Restic backup registration management' "${labels[@]}" 'Add registration' 'Update registration' 'Delete registration (dependency-safe; keep data)' 'Back'
+    case $MENU_INDEX in
+      0) ((${#ids[@]})) && : || hp_action hp_add_storage_registration;;
+      *)
+        # Resource rows are informational and deliberately selectable; actions remain fixed after them.
+        if ((MENU_INDEX < ${#ids[@]})); then continue; fi
+        case $((MENU_INDEX-${#ids[@]})) in
+          0) hp_action hp_add_storage_registration;;
+          1) select_storage && { id=$HP_SELECTED_RESOURCE; hp_action hp_update_storage_registration "$id"; };;
+          2) select_storage && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_storage "$id"; };;
+          *) return;;
+        esac;;
+    esac
+  done
+}
+
+hp_restic_servers_menu() { local id; while :; do choose_menu 'Restic · Server connections' 'Add/test server connection' 'Edit/pin/test connection' 'Test connection' 'Delete server (dependencies required)' 'Back'; case $MENU_INDEX in 0) hp_action add_controller_server;; 1) select_server && { id=$HP_SELECTED_RESOURCE; hp_action hp_edit_server "$id"; };; 2) select_server && { id=$HP_SELECTED_RESOURCE; hp_action hp_test_server "$id"; };; 3) select_server && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_server "$id"; };; *) return;; esac; done; }
+hp_restic_drives_menu() {
+  local server=$1
+  while :; do
+    choose_menu "Drives management — $server" 'List drives' 'Format drive' 'Set mount point for partition' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_list_remote_drives "$server";;
+      1) hp_action hp_format_remote_drive "$server";;
+      2) hp_action hp_mount_remote_partition "$server";;
+      *) return;;
+    esac
+  done
+}
+
+hp_restic_drive_merging_menu() {
+  local server=$1
+  while :; do
+    choose_menu "Drives merging management — $server" 'LVM' 'mergerfs' 'Set mount point' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_create_remote_lvm "$server";;
+      1) hp_action hp_create_remote_mergerfs "$server";;
+      2) hp_action hp_mount_remote_merged_storage "$server";;
+      *) return;;
+    esac
+  done
+}
+
+hp_restic_storages_menu() {
+  local server
+  while :; do
+    choose_menu 'Restic · Remote storage' 'Drives management' 'Drives merging management' 'Restic backup registration management' 'Back'
+    case $MENU_INDEX in
+      0) select_server && { server=$HP_SELECTED_RESOURCE; hp_restic_drives_menu "$server"; };;
+      1) select_server && { server=$HP_SELECTED_RESOURCE; hp_restic_drive_merging_menu "$server"; };;
+      2) hp_restic_storage_registrations_menu;;
+      *) return;;
+    esac
+  done
+}
+hp_restic_repositories_menu() { local id; while :; do choose_menu 'Restic · Repositories' 'Create restricted SFTP repository' 'Test repository access' 'Show recovery credentials' 'Delete access (keep remote data)' 'Back'; case $MENU_INDEX in 0) hp_action hp_add_repository;; 1) select_repository && { id=$HP_SELECTED_RESOURCE; hp_action hp_test_repository "$id"; };; 2) select_repository && { id=$HP_SELECTED_RESOURCE; hp_action show_controller_recovery_credentials "$id"; };; 3) select_repository && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_repository "$id"; };; *) return;; esac; done; }
+hp_run_job_background() {
+  local id=$1 unit="homephotos-restic-job-${1}-backup.service"
+  load_controller_job "$id"
+  ((${#SOURCE_PATHS[@]} > 0)) || die 'Backup job has no source paths configured. Edit the job and add at least one source before running it.'
+  write_controller_jobs "$id"
+  systemctl start --no-block "$unit"
+  note "Backup job '$id' is running in the background. Check it with: systemctl status $unit"
+}
+
+hp_view_job_background() {
+  local id=$1 unit="homephotos-restic-job-${1}-backup.service"
+  load_controller_job "$id"
+  printf '\nBackground backup status — %s (%s)\n\n' "$JOB_LABEL" "$id"
+  systemctl show "$unit" \
+    --property=Id,ActiveState,SubState,Result,ExecMainStatus,ExecMainStartTimestamp,ExecMainExitTimestamp \
+    --no-pager
+  printf '\nRecent output (last 50 lines)\n\n'
+  journalctl -u "$unit" -n 50 --no-pager
+  printf '\nFollow live output from a terminal:\n  journalctl -fu %s\n' "$unit"
+}
+
+hp_running_job_ids() {
+  local id unit
+  while IFS= read -r id; do
+    unit="homephotos-restic-job-${id}-backup.service"
+    systemctl is-active --quiet "$unit" && printf '%s\n' "$id"
+  done < <(hp_job_ids)
+}
+
+hp_select_running_job() {
+  local ids=() entries=() id
+  mapfile -t ids < <(hp_running_job_ids)
+  ((${#ids[@]})) || { note 'No backup task is currently running.'; return 1; }
+  for id in "${ids[@]}"; do entries+=("$(hp_resource_label job "$id")"); done
+  choose_menu 'Select running backup task' "${entries[@]}" 'Cancel'
+  ((MENU_INDEX < ${#ids[@]})) || return 1
+  HP_SELECTED_RESOURCE=${ids[$MENU_INDEX]}
+}
+
+hp_stop_job_background() {
+  local id=$1 unit="homephotos-restic-job-${1}-backup.service"
+  systemctl is-active --quiet "$unit" || die "Backup job '$id' is not running."
+  systemctl stop "$unit"
+  note "Backup job '$id' stopped. Its schedule remains enabled."
+}
+
+hp_restic_jobs_menu() {
+  local id running
+  while :; do
+    running=$(hp_running_job_ids)
+    if [[ -n $running ]]; then
+      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Run backup now' 'Run backup now in background' 'View background backup task' 'Stop running backup task' 'View snapshots' 'Delete job' 'Back'
+      case $MENU_INDEX in
+        0) hp_action hp_add_job;;
+        1) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_edit_job "$id"; };;
+        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
+        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
+        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
+        5) hp_select_running_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_stop_job_background "$id"; };;
+        6) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
+        7) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
+        *) return;;
+      esac
+    else
+      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Run backup now' 'Run backup now in background' 'View background backup task' 'View snapshots' 'Delete job' 'Back'
+      case $MENU_INDEX in
+        0) hp_action hp_add_job;;
+        1) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_edit_job "$id"; };;
+        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
+        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
+        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
+        5) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
+        6) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
+        *) return;;
+      esac
+    fi
+  done
+}
+restic_controller_menu() { hp_restic_init; while :; do choose_menu 'Restic resource management' 'Server connections' 'Remote storage' 'Repositories' 'Backup jobs/settings' 'Dry-run all jobs' 'Migrate legacy combined profile' 'Back'; case $MENU_INDEX in 0) hp_restic_servers_menu;; 1) hp_restic_storages_menu;; 2) hp_restic_repositories_menu;; 3) hp_restic_jobs_menu;; 4) hp_action hp_dry_run_all_jobs;; 5) ask_name 'Legacy profile id' old; hp_action hp_migrate_legacy_profile "$REPLY";; *) return;; esac; done; }
 
 # Keeping the functions sourceable makes it possible to test hardware-detection
 # helpers without starting the interactive installer.
