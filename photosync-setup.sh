@@ -1160,10 +1160,12 @@ REMOTE_SCRIPT
   remote_controller_exec "$remote_server_id" "$remote_script" || die "Remote provisioning failed for $id."
 }
 
-restic_controller_command() {
+restic_controller_command() (
   local id=$1 action=$2 dir repository_url password_command sftp_command credential_id=$1 lock_fd lock_path
   shift 2
-  if [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]]; then
+  if [[ $action == restore || $action == ls || $action == repository-snapshots ]] && [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
+    hp_resolve_repository "$id"
+  elif [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]]; then
     hp_resolve_job "$id"
     credential_id=$JOB_REPOSITORY_ID
   elif [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
@@ -1171,11 +1173,11 @@ restic_controller_command() {
   else
     load_controller_server "$id"
   fi
-  if [[ $action == backup ]]; then
+  if [[ $action == backup || $action == maintenance || $action == restore ]]; then
     hp_restic_init
     lock_path="$RESTIC_LOCKS_DIR/repository-${credential_id}.lock"
     exec {lock_fd}>"$lock_path"
-    flock -n "$lock_fd" || die "Another backup is already running for repository '$credential_id'."
+    flock -n "$lock_fd" || die "Repository '$credential_id' is busy (backup/maintenance/restore). Stop its configured service or wait for the foreground command to finish; do not force-unlock or kill arbitrary PIDs."
   fi
   hp_install_self
   dir=$(controller_server_dir "$SERVER_ID")
@@ -1210,8 +1212,15 @@ restic_controller_command() {
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
         cat config >/dev/null
       ;;
-    snapshots)
+    repository-snapshots)
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" snapshots "$@"
+      ;;
+    snapshots|ls)
+      restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" "$action" "$@"
+      ;;
+    restore)
+      local RESTIC_RESTORE_COMMAND=(restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command")
+      hp_restore_locked "$@"
       ;;
     maintenance)
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
@@ -1222,7 +1231,7 @@ restic_controller_command() {
       ;;
     *) die "Unknown Restic controller action: $action" ;;
   esac
-}
+)
 
 write_controller_jobs() {
   local id=$1 service timer maintenance_service maintenance_timer
@@ -3453,11 +3462,17 @@ hp_view_job_background() {
   printf '\nFollow live output from a terminal:\n  journalctl -fu %s\n' "$unit"
 }
 
+hp_backup_unit_running() {
+  local state
+  state=$(systemctl show "$1" -p ActiveState --value) || return 1
+  [[ $state == active || $state == activating || $state == reloading || $state == deactivating ]]
+}
+
 hp_running_job_ids() {
   local id unit
   while IFS= read -r id; do
     unit="homephotos-restic-job-${id}-backup.service"
-    systemctl is-active --quiet "$unit" && printf '%s\n' "$id"
+    hp_backup_unit_running "$unit" && printf '%s\n' "$id"
   done < <(hp_job_ids)
 }
 
@@ -3473,7 +3488,7 @@ hp_select_running_job() {
 
 hp_stop_job_background() {
   local id=$1 unit="homephotos-restic-job-${1}-backup.service"
-  systemctl is-active --quiet "$unit" || die "Backup job '$id' is not running."
+  hp_backup_unit_running "$unit" || die "Backup job '$id' is not running."
   systemctl stop "$unit"
   note "Backup job '$id' stopped. Its schedule remains enabled."
 }
@@ -3510,7 +3525,212 @@ hp_restic_jobs_menu() {
     fi
   done
 }
-restic_controller_menu() { hp_restic_init; while :; do choose_menu 'Restic resource management' 'Server connections' 'Remote storage' 'Repositories' 'Backup jobs/settings' 'Dry-run all jobs' 'Migrate legacy combined profile' 'Back'; case $MENU_INDEX in 0) hp_restic_servers_menu;; 1) hp_restic_storages_menu;; 2) hp_restic_repositories_menu;; 3) hp_restic_jobs_menu;; 4) hp_action hp_dry_run_all_jobs;; 5) ask_name 'Legacy profile id' old; hp_action hp_migrate_legacy_profile "$REPLY";; *) return;; esac; done; }
+# Restore is repository-scoped: no job is needed to recover an old snapshot.
+hp_restore_valid_path() {
+  local path=$1
+  [[ $path == /* && $path != / && $path != */ && $path != *//* && /$path/ != */../* && /$path/ != */./* && $path != *[$'\001'-$'\037'$'\177']* ]] || return 1
+  case $path in *'*'*|*'?'*|*'['*|*']'*|*'\'*) return 1;; esac
+  return 0
+}
+
+hp_restore_select_snapshot() {
+  local repository=$1 json row ids=() labels=()
+  command_exists jq || install_packages jq
+  json=$(restic_controller_command "$repository" repository-snapshots --json) || die 'Cannot read snapshots.'
+  jq -e 'type == "array" and all(.[]; (.id | test("^[0-9a-f]{64}$")) and (.paths | type == "array" and length > 0 and all(.[]; type == "string")))' <<< "$json" >/dev/null || die 'Invalid snapshot JSON.'
+  mapfile -t ids < <(jq -r 'sort_by(.time) | reverse | .[].id' <<< "$json")
+  ((${#ids[@]})) || { note 'This repository has no snapshots.'; return 1; }
+  mapfile -t labels < <(jq -r 'sort_by(.time) | reverse | .[] | [.time, (.hostname // "unknown"), ((.tags // []) | join(",")), (.paths | join(",")), .id] | @json' <<< "$json")
+  choose_menu 'Snapshot: time, hostname, tags, source paths, immutable ID' "${labels[@]}" 'Cancel'
+  ((MENU_INDEX < ${#ids[@]})) || return 1
+  HP_RESTORE_SNAPSHOT=${ids[$MENU_INDEX]}
+  HP_RESTORE_SNAPSHOT_JSON=$(jq -c --arg id "$HP_RESTORE_SNAPSHOT" '.[] | select(.id == $id)' <<< "$json")
+}
+
+hp_restore_stop_backups() {
+  local id unit state units=() ids=()
+  # Check every configured job, including oneshot services still activating.
+  mapfile -t ids < <(hp_job_ids)
+  for id in "${ids[@]}"; do
+    unit="homephotos-restic-job-${id}-backup.service"
+    state=$(systemctl show "$unit" -p ActiveState --value) || die "Cannot inspect backup service $unit."
+    case $state in active|activating|reloading|deactivating) units+=("$unit");; esac
+  done
+  ((${#units[@]})) || return 0
+  printf 'Running backup services:\n'; printf '  %s\n' "${units[@]}"
+  confirm 'Stop these backup runs first? Their timers remain enabled; declining cancels restore.' || return 1
+  for unit in "${units[@]}"; do
+    systemctl stop "$unit" || die "Could not stop $unit; restore cancelled."
+    hp_backup_unit_running "$unit" && die "$unit is still running; restore cancelled."
+  done
+  return 0
+}
+
+hp_restore_destination_guard() {
+  local path=$1 original=$2 ancestor=$1 component current='' mount dev rootdev entry
+  hp_restore_valid_path "$path" || die "Unsafe restore destination: $path"
+  case $path in /mnt/*|/media/*|/srv/*) :;; *) die 'Restore destinations must be beneath /mnt, /media or /srv, never system directories.';; esac
+  # Walk each component explicitly, including dangling links.
+  local components=()
+  IFS=/ read -r -a components <<< "$path"
+  for component in "${components[@]}"; do
+    [[ -n $component ]] || continue
+    current+="/$component"
+    [[ ! -L $current ]] || die "Symlink in restore destination: $current"
+    [[ ! -e $current || -d $current ]] || die "Non-directory destination ancestor: $current"
+  done
+  while [[ ! -e $ancestor ]]; do ancestor=${ancestor%/*}; [[ -n $ancestor ]] || ancestor=/; done
+  mount=$(findmnt -rn --target "$ancestor" -o TARGET) || die "Cannot find destination mount: $path"
+  dev=$(findmnt -rn --target "$ancestor" -o MAJ:MIN) || die 'Cannot identify restore destination device.'
+  rootdev=$(findmnt -rn --target / -o MAJ:MIN) || die 'Cannot identify system root device.'
+  [[ $mount != / && -n $dev && $dev != "$rootdev" ]] || die "Refusing root-disk fallback for $path. Mount the photo/recovery disk first."
+  if [[ $original == yes && -f $HOME_PHOTOS_DIR/storage.conf ]]; then
+    hp_storage_guard
+    [[ $path == "$HP_STORAGE_MOUNT" || $path == "$HP_STORAGE_MOUNT/"* ]] || die "Original destination is not registered photo storage: $path"
+    [[ $mount == "$HP_STORAGE_MOUNT" ]] || die 'Original destination mount differs from registered photo storage.'
+  fi
+  # Restic must not traverse existing descendant links or nested mount points.
+  if [[ -d $path ]]; then
+    entry=$(find "$path" -type l -print -quit) || die 'Cannot inspect destination symlinks.'
+    [[ -z $entry ]] || die "Destination contains a symlink: $entry. Use an empty separate destination."
+    while IFS= read -r entry; do
+      [[ $entry != "$path/"* ]] || die "Nested destination mount: $entry"
+    done < <(findmnt -rn -o TARGET)
+  fi
+  HP_RESTORE_MOUNT=$(findmnt -rn --target "$ancestor" -o TARGET,SOURCE,FSTYPE,MAJ:MIN,OPTIONS) || die 'Cannot fingerprint destination mount.'
+}
+
+hp_restore_is_empty() {
+  local entry
+  [[ -d $1 ]] || return 0
+  entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit) || die "Cannot inspect destination: $1"
+  [[ -z $entry ]]
+}
+
+hp_restore_locked() {
+  local snapshot=$1 mode=$2 json nodes help locks path root inside target=/ overwrite=never original=yes
+  local roots=() selected=() args=() destinations=() mounts=() original_mounts=() root_json nonempty=no index
+  [[ $snapshot =~ ^[0-9a-f]{64}$ ]] || die 'Restore requires a full immutable snapshot ID.'
+  command_exists jq || install_packages jq
+  help=$(restic restore --help) || die 'Cannot inspect installed Restic restore capabilities.'
+  grep -q -- '--verify' <<< "$help" || die 'Installed Restic lacks restore --verify. Upgrade Restic before restoring.'
+  grep -q -- '--overwrite' <<< "$help" && grep -q 'never' <<< "$help" && grep -q 'always' <<< "$help" || die 'Installed Restic lacks --overwrite always/never. Upgrade Restic (Debian 11 stock is too old); no unsafe fallback is used.'
+  # Never unlock: even an externally launched foreground backup must block us.
+  locks=$("${RESTIC_RESTORE_COMMAND[@]}" list locks) || die 'Cannot inspect repository locks.'
+  [[ -z $locks ]] || die 'Repository has Restic locks. Wait for foreground backups/maintenance to finish; inspect restic list locks. Do not force-unlock or kill arbitrary PIDs.'
+  json=$("${RESTIC_RESTORE_COMMAND[@]}" snapshots --json "$snapshot") || die 'Cannot reload chosen snapshot.'
+  json=$(jq -ce --arg id "$snapshot" 'map(select(.id == $id)) | if length == 1 then .[0] else error("snapshot missing/ambiguous") end' <<< "$json") || die 'Selected immutable snapshot is unavailable.'
+  root_json=$(jq -ce '.paths | select(type == "array" and length > 0 and all(.[]; type == "string"))' <<< "$json") || die 'Snapshot has no valid source roots.'
+  jq -e 'all(.[]; explode | all(.[]; . >= 32 and . != 127))' <<< "$root_json" >/dev/null || die 'Snapshot source roots contain control characters.'
+  mapfile -t roots < <(jq -r '.[]' <<< "$root_json")
+  for root in "${roots[@]}"; do hp_restore_valid_path "$root" || die "Unsafe snapshot source root: $root"; done
+  nodes=$("${RESTIC_RESTORE_COMMAND[@]}" ls --json "$snapshot") || die 'Cannot list snapshot paths.'
+  # Restic ls is newline-delimited JSON. Validate before any filesystem writes.
+  jq -se 'length > 0 and all(.[]; type == "object") and all(.[] | select(.struct_type == "node"); (.path | type == "string" and startswith("/") and (explode | all(.[]; . >= 32 and . != 127)) and (contains("//") | not) and (split("/") | all(.[]; . != "." and . != ".."))))' <<< "$nodes" >/dev/null || die 'Invalid or unsafe snapshot path JSON.'
+  case $mode in
+    full) selected=("${roots[@]}");;
+    selected)
+      printf 'Snapshot source roots:\n'; printf '  %s\n' "${roots[@]}"
+      while :; do
+        printf 'Absolute snapshot file/directory to restore (blank finishes): '
+        IFS= read -r path || return 1
+        [[ -n $path ]] || break
+        hp_restore_valid_path "$path" || die 'Path must be absolute and canonical, without controls or glob metacharacters.'
+        inside=no
+        for root in "${roots[@]}"; do [[ $path == "$root" || $path == "$root/"* ]] && inside=yes; done
+        [[ $inside == yes ]] || die 'Selected path is outside snapshot source roots.'
+        jq -se --arg path "$path" 'any(.[]; .struct_type == "node" and .path == $path and (.type == "file" or .type == "dir"))' <<< "$nodes" >/dev/null || die 'Selected file/directory does not exist in this snapshot.'
+        selected+=("$path")
+      done
+      ((${#selected[@]})) || { note 'No paths selected; restore cancelled.'; return 0; };;
+    *) die 'Unknown restore mode.';;
+  esac
+  # Conservative refusal of symlink/special nodes in the selected trees avoids
+  # a restored link becoming an ancestor of subsequent writes.
+  for path in "${selected[@]}"; do
+    jq -se --arg path "$path" 'all(.[] | select(.struct_type == "node" and (.path == $path or (.path | startswith($path + "/")))); (.type == "file" or .type == "dir"))' <<< "$nodes" >/dev/null || die 'Selected snapshot tree contains symlink/special nodes; choose ordinary file/directory paths instead.'
+    args+=(--include "$path")
+  done
+  # Original locations are default. Only ordinary photo/data storage is allowed.
+  for root in "${roots[@]}"; do
+    case $root in /mnt/*|/media/*|/srv/*) :;; *) original=no;; esac
+  done
+  if [[ $original == yes ]]; then
+    for root in "${roots[@]}"; do
+      # A missing/unmounted original is recoverable via an empty separate disk.
+      if ! (hp_restore_destination_guard "$root" yes); then original=no; break; fi
+      hp_restore_destination_guard "$root" yes
+      original_mounts+=("$HP_RESTORE_MOUNT")
+      hp_restore_is_empty "$root" || nonempty=yes
+    done
+  fi
+  if [[ $original == no || $nonempty == yes ]]; then
+    choose_menu 'Restore destination (merge replaces conflicts, keeps unrelated files)' 'Original folders: explicit merge/overwrite' 'Separate empty destination (full snapshot hierarchy)' 'Cancel'
+    case $MENU_INDEX in
+      0) [[ $original == yes ]] || die 'System source folders cannot be restored in place. Choose a separate destination.'
+         confirm 'Replace conflicting files in original source folders, keeping unrelated files?' || return 0
+         overwrite=always;;
+      1) original=no
+         ask_absolute_path 'Separate EMPTY mounted restore directory' /mnt/restore
+         target=$REPLY
+         hp_restore_destination_guard "$target" no
+         hp_restore_is_empty "$target" || die 'Separate destination must be empty; no files will be overwritten.';;
+      *) return 0;;
+    esac
+  fi
+  if [[ $original == yes ]]; then destinations=("${roots[@]}"); else destinations=("$target"); fi
+  for index in "${!destinations[@]}"; do
+    path=${destinations[$index]}
+    hp_restore_destination_guard "$path" "$original"
+    if [[ $original == yes ]]; then
+      [[ $HP_RESTORE_MOUNT == "${original_mounts[$index]}" ]] || die 'Original destination mount changed during confirmation.'
+    fi
+    mounts+=("$HP_RESTORE_MOUNT")
+  done
+  hp_restore_stop_backups || return 0
+  # Recheck after prompts and immediately before writing, while repo lock held.
+  for index in "${!destinations[@]}"; do
+    path=${destinations[$index]}
+    hp_restore_destination_guard "$path" "$original"
+    [[ $HP_RESTORE_MOUNT == "${mounts[$index]}" ]] || die 'Destination mount changed; restore cancelled.'
+    if [[ $overwrite == never ]]; then hp_restore_is_empty "$path" || die 'Destination became nonempty; restore cancelled.'; fi
+  done
+  locks=$("${RESTIC_RESTORE_COMMAND[@]}" list locks) || die 'Cannot recheck repository locks.'
+  [[ -z $locks ]] || die 'Repository became busy; restore cancelled. Wait for the other command to finish.'
+  [[ $original == yes ]] || mkdir -p -- "$target"
+  printf 'Restoring immutable snapshot %s to %s (overwrite=%s, verify enabled)\n' "$snapshot" "$target" "$overwrite"
+  "${RESTIC_RESTORE_COMMAND[@]}" restore "$snapshot" --target "$target" --verify --overwrite "$overwrite" "${args[@]}" || die 'Restic restore/verification failed; partial files may remain. No success reported.'
+  note 'Restore completed and verified.'
+}
+
+hp_restore_action() {
+  local mode=$1 repository
+  select_repository || return 0
+  repository=$HP_SELECTED_RESOURCE
+  hp_restore_select_snapshot "$repository" || return 0
+  if [[ $mode == browse ]]; then
+    printf 'Snapshot details (hostname, time, tags, source paths):\n'
+    jq '{id, hostname, time, tags, paths}' <<< "$HP_RESTORE_SNAPSHOT_JSON"
+    restic_controller_command "$repository" ls "$HP_RESTORE_SNAPSHOT" || die 'Snapshot browsing failed.'
+    return 0
+  fi
+  hp_restore_stop_backups || return 0
+  restic_controller_command "$repository" restore "$HP_RESTORE_SNAPSHOT" "$mode"
+}
+
+hp_restic_restore_menu() {
+  while :; do
+    choose_menu 'Restic · Restore' 'Browse snapshots and paths' 'Restore entire snapshot' 'Restore selected files/directories' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_restore_action browse;;
+      1) hp_action hp_restore_action full;;
+      2) hp_action hp_restore_action selected;;
+      *) return;;
+    esac
+  done
+}
+
+restic_controller_menu() { hp_restic_init; while :; do choose_menu 'Restic resource management' 'Server connections' 'Remote storage' 'Repositories' 'Backup jobs/settings' 'Dry-run all jobs' 'Restore Restic backup' 'Migrate legacy combined profile' 'Back'; case $MENU_INDEX in 0) hp_restic_servers_menu;; 1) hp_restic_storages_menu;; 2) hp_restic_repositories_menu;; 3) hp_restic_jobs_menu;; 4) hp_action hp_dry_run_all_jobs;; 5) hp_restic_restore_menu;; 6) ask_name 'Legacy profile id' old; hp_action hp_migrate_legacy_profile "$REPLY";; *) return;; esac; done; }
 
 # Keeping the functions sourceable makes it possible to test hardware-detection
 # helpers without starting the interactive installer.
