@@ -28,14 +28,18 @@ if [ "${1:-}" != "install" ] && [ ! -d "$CONFIG_DIR" ] && [ -t 0 ]; then
 fi
 
 SNF_SCRIPT_PATH="$0" python3 - "$@" <<'PY'
+import glob
 import gzip
 import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import time
+import urllib.parse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,22 +51,27 @@ LOG_FILE = Path("/var/log/smart_nginx_firewall.log")
 INSTALL_TARGET = Path("/usr/local/bin/smart_nginx_firewall")
 INSTALL_LINK = Path("/usr/local/bin/snf")
 CRON_FILE = Path("/etc/cron.d/smart_nginx_firewall")
+LOCK_FILE = Path("/run/smart_nginx_firewall.lock")
 IPSET_NAME = "snf_blacklist"
 IPTABLES_CHAIN = "SNF_BLOCK"
 
 DEFAULT_CONFIG = {
     "version": 1,
-    "nginx_log_glob": "/var/log/nginx/access.log*",
+    "nginx_log_glob": "/var/log/nginx/*access.log*",
     "scan_hours": 24,
     "block_days": 7,
     "threshold_score": 25,
     "threshold_bad_requests": 40,
+    "threshold_transmission_auth_failures": 5,
     "minimum_non_wpad_signals": 3,
-    "minimum_bad_signal_rate": 0.02,
+    "minimum_bad_signal_rate": 0.05,
     "minimum_good_requests_for_rate_check": 100,
     "max_candidates_to_apply": 200,
     "use_ipset_if_available": True,
-    "private_ranges_always_allow": True
+    "private_ranges_always_allow": True,
+    "protect_openvpn_endpoints": True,
+    "openvpn_config_dir": "/etc/openvpn",
+    "openvpn_remote_endpoints": []
 }
 
 DEFAULT_STATE = {
@@ -81,14 +90,22 @@ LOG_RE = re.compile(
     r'(?P<status>\d{3}) (?P<body>\S+) "(?P<ref>[^"]*)" "(?P<ua>[^"]*)"'
 )
 
-BAD_PATTERNS = [
+# Path-only attack patterns (tested against raw and one-decoded path only)
+PATH_BAD_PATTERNS = [
     ("wordpress", 10, re.compile(r"/(wp-admin|wp-login\.php|xmlrpc\.php|wp-content|wp-includes)", re.I)),
     ("secret-file", 10, re.compile(r"/(\.env|config\.json|config\.php|backup|dump|database|db\.|\.aws|credentials)", re.I)),
     ("vcs-leak", 10, re.compile(r"/(\.git|\.svn|\.hg)", re.I)),
     ("camera-router", 8, re.compile(r"/(ISAPI|SDK|HNAP1|onvif|cgi-bin/luci|boaform)", re.I)),
     ("php-probe", 7, re.compile(r"(\.php|/phpmyadmin|/pma/|phpunit|eval-stdin)", re.I)),
-    ("traversal-injection", 8, re.compile(r"(\.\.|%2e|%2f|%5c|/etc/passwd|union.*select|<script)", re.I)),
+    ("traversal", 8, re.compile(r"(?:\.\.[\/\\]|[\/\\]\.\.(?:[\/\\]|$)|/etc/passwd|/etc/shadow|/proc/self/|/winnt/win\.ini|/windows/system32/|/windows/system\.ini)", re.I)),
+    ("traversal-raw", 8, re.compile(r"(?:%2e%2e[\/\\%]|%2e%2e/|%2e%2e%2f|%2e%2e%5c|\.\.%2f|\.\.%5c)", re.I)),
     ("wpad", 1, re.compile(r"/wpad\.dat", re.I)),
+]
+
+# Query-only attack patterns (tested against query string only; never request bodies)
+QUERY_BAD_PATTERNS = [
+    ("sqli", 8, re.compile(r"(?:\bunion\s+(?:all\s+)?select\b|\bselect\b.+\bfrom\b|\binsert\s+into\b|\bdrop\s+table\b|\bwaitfor\s+delay\b|\bbenchmark\s*\()", re.I)),
+    ("xss", 8, re.compile(r"(?:<script|javascript:|onerror\s*=|onload\s*=|alert\s*\(|<img\s+[^>]*src)", re.I)),
 ]
 
 SUSPICIOUS_METHODS = {
@@ -110,7 +127,23 @@ def parse_iso(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 def run(cmd, check=False):
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+    except FileNotFoundError:
+        class DummyRes:
+            returncode = 127
+            stdout = ''
+            stderr = 'command not found'
+        if check:
+            raise
+        return DummyRes()
+
+def run_required(cmd):
+    result = run(cmd)
+    if result.returncode != 0:
+        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "unknown error").strip()
+        raise RuntimeError(f"command failed ({result.returncode}): {' '.join(cmd)}: {detail}")
+    return result
 
 def have(cmd):
     return shutil.which(cmd) is not None
@@ -149,6 +182,51 @@ def is_ip(value):
     except ValueError:
         return False
 
+_OPENVPN_CACHE = {"ts": 0.0, "endpoints": []}
+
+def get_openvpn_endpoints(cfg):
+    now = time.time()
+    if now - _OPENVPN_CACHE["ts"] < 300 and _OPENVPN_CACHE["endpoints"]:
+        return _OPENVPN_CACHE["endpoints"]
+
+    endpoints = set()
+    for ep in cfg.get("openvpn_remote_endpoints", []):
+        if ep:
+            endpoints.add(str(ep).strip())
+
+    if cfg.get("protect_openvpn_endpoints", True):
+        ovpn_dir = Path(cfg.get("openvpn_config_dir", "/etc/openvpn"))
+        if ovpn_dir.is_dir():
+            for filepath in sorted(glob.glob(str(ovpn_dir / "*"))):
+                if filepath.endswith((".conf", ".ovpn")):
+                    try:
+                        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line.startswith("remote ") and not line.startswith("#"):
+                                    parts = line.split()
+                                    if len(parts) >= 2:
+                                        endpoints.add(parts[1].strip())
+                    except OSError:
+                        pass
+
+    resolved = set()
+    for ep in endpoints:
+        if is_ip(ep):
+            resolved.add(ep)
+        else:
+            try:
+                addr_info = socket.getaddrinfo(ep, None, socket.AF_INET)
+                for item in addr_info:
+                    resolved.add(item[4][0])
+            except (socket.gaierror, OSError):
+                pass
+
+    res_list = sorted(resolved)
+    _OPENVPN_CACHE["ts"] = now
+    _OPENVPN_CACHE["endpoints"] = res_list
+    return res_list
+
 def is_whitelisted(ip, state, cfg):
     try:
         addr = ipaddress.ip_address(ip)
@@ -166,6 +244,13 @@ def is_whitelisted(ip, state, cfg):
                 return True
         except ValueError:
             continue
+    if cfg.get("protect_openvpn_endpoints", True):
+        try:
+            ovpn_ips = get_openvpn_endpoints(cfg)
+            if ip in ovpn_ips:
+                return True
+        except Exception:
+            pass
     return False
 
 def block_lookup(state):
@@ -187,12 +272,13 @@ class Stat:
         self.paths = Counter()
         self.bad_reasons = Counter()
         self.bad_requests = 0
+        self.transmission_auth_failures = 0
         self.good_requests = 0
         self.wpad_only_count = 0
         self.first_seen = None
         self.last_seen = None
 
-    def add(self, ts, method, path, status, req, ua):
+    def add(self, ts, method, path, status, req, ua, source=""):
         self.total += 1
         self.status[status] += 1
         self.methods[method] += 1
@@ -203,37 +289,85 @@ class Stat:
             self.good_requests += 1
         if status in {"400", "401", "403", "404", "405"}:
             self.bad_requests += 1
+        if status in {"401", "403"} and "down_access.log" in str(source):
+            self.transmission_auth_failures += 1
 
-        hay = f"{method} {path} {req} {ua}"
+        # Extract target, path, and query safely from request line
+        parts = req.split()
+        target = parts[1] if len(parts) >= 2 else (path or req)
+        if "?" in target:
+            req_path, req_query = target.split("?", 1)
+        else:
+            req_path, req_query = target, ""
+
+        path_to_check = path or req_path
+        decoded_path = urllib.parse.unquote(path_to_check)
+        decoded_query = urllib.parse.unquote(req_query) if req_query else ""
+
         matched = False
-        for name, _weight, rx in BAD_PATTERNS:
-            if rx.search(hay):
-                self.bad_reasons[name] += 1
-                matched = True
+
+        # 1. Path-only rules: inspected against raw path and safely one-decoded path
+        for name, _weight, rx in PATH_BAD_PATTERNS:
+            if name == "traversal-raw":
+                if rx.search(path_to_check):
+                    self.bad_reasons["traversal"] += 1
+                    matched = True
+            elif name == "traversal":
+                if rx.search(path_to_check) or rx.search(decoded_path):
+                    self.bad_reasons["traversal"] += 1
+                    matched = True
+            else:
+                if rx.search(path_to_check) or rx.search(decoded_path):
+                    self.bad_reasons[name] += 1
+                    matched = True
+
+        # 2. Query-only rules: inspected against query only (never request body)
+        if req_query:
+            for name, _weight, rx in QUERY_BAD_PATTERNS:
+                if rx.search(req_query) or rx.search(decoded_query):
+                    self.bad_reasons[name] += 1
+                    matched = True
+
+        # 3. HTTP method inspection
         if method in SUSPICIOUS_METHODS:
             self.bad_reasons[f"method:{method}"] += 1
             matched = True
         elif method and method not in NORMAL_METHODS:
             self.bad_reasons["method:garbage"] += 1
             matched = True
-        if path == "/wpad.dat" and matched and len(self.bad_reasons) == 1:
+
+        if path_to_check == "/wpad.dat" and matched and len(self.bad_reasons) == 1:
             self.wpad_only_count += 1
 
     def score(self):
         score = 0
         score += min(self.status["404"] + self.status["400"], 20)
         score += min(self.status["401"] + self.status["403"] + self.status["405"], 10)
-        for name, weight, _rx in BAD_PATTERNS:
-            count = self.bad_reasons[name]
-            if name == "wpad":
-                score += min(count * weight, 5)
-            else:
-                score += min(count * weight, 60)
+
+        weights = {
+            "wordpress": 10,
+            "secret-file": 10,
+            "vcs-leak": 10,
+            "camera-router": 8,
+            "php-probe": 7,
+            "traversal": 8,
+            "traversal-injection": 8,
+            "sqli": 8,
+            "xss": 8,
+            "wpad": 1,
+        }
+
         for name, count in self.bad_reasons.items():
-            if name.startswith("method:"):
+            if name == "wpad":
+                score += min(count * 1, 5)
+            elif name.startswith("method:"):
                 method = name.split(":", 1)[1]
                 score += min(count * SUSPICIOUS_METHODS.get(method, 5), 40)
-        distinct_bad_paths = sum(1 for p in self.paths if any(rx.search(p) for _n, _w, rx in BAD_PATTERNS))
+            else:
+                weight = weights.get(name, 8)
+                score += min(count * weight, 60)
+
+        distinct_bad_paths = sum(1 for p in self.paths if any(rx.search(p) for _n, _w, rx in PATH_BAD_PATTERNS))
         score += min(distinct_bad_paths * 3, 30)
         return score
 
@@ -252,16 +386,18 @@ class Stat:
     def should_block(self, cfg):
         score = self.score()
         non_wpad_signals = self.non_wpad_signals()
+        if self.transmission_auth_failures >= int(cfg.get("threshold_transmission_auth_failures", 5)):
+            return True
         if non_wpad_signals < int(cfg.get("minimum_non_wpad_signals", 3)):
             return False
         suspicious_paths = [
             p for p in self.paths
-            if p != "/wpad.dat" and any(rx.search(p) for name, _w, rx in BAD_PATTERNS if name != "wpad")
+            if p != "/wpad.dat" and any(rx.search(p) for name, _w, rx in PATH_BAD_PATTERNS if name != "wpad")
         ]
         if self.total < 5 and len(suspicious_paths) <= 1 and self.bad_requests < 3:
             return False
         minimum_good = int(cfg.get("minimum_good_requests_for_rate_check", 100))
-        minimum_rate = float(cfg.get("minimum_bad_signal_rate", 0.02))
+        minimum_rate = float(cfg.get("minimum_bad_signal_rate", 0.05))
         if self.good_requests >= minimum_good and self.bad_signal_rate() < minimum_rate:
             return False
         if score >= int(cfg["threshold_score"]):
@@ -275,7 +411,8 @@ class Stat:
             f"score={self.score()}",
             f"bad={self.bad_requests}",
             f"good={self.good_requests}",
-            f"bad_signal_rate={self.bad_signal_rate():.4f}"
+            f"bad_signal_rate={self.bad_signal_rate():.4f}",
+            f"transmission_auth={self.transmission_auth_failures}"
         ]
         if self.status:
             parts.append("status=" + ",".join(f"{k}:{v}" for k, v in self.status.most_common(4)))
@@ -289,7 +426,6 @@ class Stat:
 def scan_logs(cfg):
     cutoff = now_utc() - timedelta(hours=int(cfg["scan_hours"]))
     stats = defaultdict(Stat)
-    import glob
     for name in sorted(glob.glob(cfg["nginx_log_glob"])):
         try:
             fh = log_open(name)
@@ -314,7 +450,7 @@ def scan_logs(cfg):
                 method = parts[0] if len(parts) >= 1 else ""
                 target = parts[1] if len(parts) >= 2 else req
                 path = target.split("?", 1)[0]
-                stats[ip].add(ts, method, path, m.group("status"), req, m.group("ua"))
+                stats[ip].add(ts, method, path, m.group("status"), req, m.group("ua"), source=name)
     return stats
 
 def firewall_backend(cfg):
@@ -322,60 +458,135 @@ def firewall_backend(cfg):
         return "ipset"
     return "iptables"
 
+def _check_multiport_supported():
+    res = run(["iptables", "-C", "INPUT", "-p", "tcp", "-m", "multiport", "--dports", "80,443", "-j", "ACCEPT"])
+    return res.returncode != 2
+
+def get_firewall_hook_spec(backend="iptables"):
+    multiport_ok = _check_multiport_supported()
+    if backend == "ipset":
+        if multiport_ok:
+            return ["-p", "tcp", "-m", "multiport", "--dports", "80,443", "-m", "set", "--match-set", IPSET_NAME, "src", "-j", "DROP"]
+        else:
+            return ["-p", "tcp", "-m", "u32", "--u32", "0>>22&0x3C@0&0xFFFF=80,443", "-m", "set", "--match-set", IPSET_NAME, "src", "-j", "DROP"]
+    else:
+        if multiport_ok:
+            return ["-p", "tcp", "-m", "multiport", "--dports", "80,443", "-j", IPTABLES_CHAIN]
+        else:
+            return ["-p", "tcp", "-m", "u32", "--u32", "0>>22&0x3C@0&0xFFFF=80,443", "-j", IPTABLES_CHAIN]
+
+def delete_all_rules(rule):
+    while run(["iptables", "-C"] + rule).returncode == 0:
+        run_required(["iptables", "-D"] + rule)
+
+def reconcile_firewall_hooks(cfg):
+    backend = firewall_backend(cfg)
+
+    # 1. Prepare the destination resource before touching any active hook.
+    if backend == "ipset":
+        run_required(["ipset", "create", IPSET_NAME, "hash:ip", "timeout", "604800", "-exist"])
+    else:
+        chain_check = run(["iptables", "-L", IPTABLES_CHAIN, "-n"])
+        if chain_check.returncode != 0:
+            run_required(["iptables", "-N", IPTABLES_CHAIN])
+
+    desired_hook = get_firewall_hook_spec(backend)
+    initial = run_required(["iptables", "-S", "INPUT"]).stdout or ""
+    initial_rules = [line.strip() for line in initial.splitlines() if line.startswith("-A INPUT")]
+    desired_present = run(["iptables", "-C", "INPUT"] + desired_hook).returncode == 0
+    snf_positions = [
+        index for index, rule in enumerate(initial_rules, start=1)
+        if IPTABLES_CHAIN in rule or IPSET_NAME in rule
+    ]
+
+    # 2. Preserve a correct unique hook at line 1 and its counters. Otherwise
+    # install and verify the replacement first, before deleting legacy hooks.
+    if desired_present and snf_positions == [1]:
+        return
+    run_required(["iptables", "-I", "INPUT", "1"] + desired_hook)
+    if run(["iptables", "-C", "INPUT"] + desired_hook).returncode != 0:
+        raise RuntimeError("failed to verify the installed SNF firewall hook")
+
+    # 3. The replacement is now line 1. Every pre-existing SNF/ipset hook was
+    # shifted down by one; delete them in descending order without a fail-open
+    # interval, including unknown legacy variants.
+    for position in sorted((p + 1 for p in snf_positions), reverse=True):
+        run_required(["iptables", "-D", "INPUT", str(position)])
+
+    final = run_required(["iptables", "-S", "INPUT"]).stdout or ""
+    final_rules = [line.strip() for line in final.splitlines() if line.startswith("-A INPUT")]
+    final_snf_rules = [
+        rule for rule in final_rules
+        if IPTABLES_CHAIN in rule or IPSET_NAME in rule
+    ]
+    if len(final_snf_rules) != 1:
+        raise RuntimeError(f"expected one SNF firewall hook, found {len(final_snf_rules)}")
+    if run(["iptables", "-C", "INPUT"] + desired_hook).returncode != 0:
+        raise RuntimeError("final SNF firewall hook does not match the desired rule")
+
 def ensure_firewall(cfg):
     backend = firewall_backend(cfg)
-    if backend == "ipset":
-        run(["ipset", "create", IPSET_NAME, "hash:ip", "timeout", "604800", "-exist"])
-        check = run(["iptables", "-C", "INPUT", "-m", "set", "--match-set", IPSET_NAME, "src", "-j", "DROP"])
-        if check.returncode != 0:
-            run(["iptables", "-I", "INPUT", "1", "-m", "set", "--match-set", IPSET_NAME, "src", "-j", "DROP"])
-    else:
-        run(["iptables", "-N", IPTABLES_CHAIN])
-        check = run(["iptables", "-C", "INPUT", "-j", IPTABLES_CHAIN])
-        if check.returncode != 0:
-            run(["iptables", "-I", "INPUT", "1", "-j", IPTABLES_CHAIN])
+    reconcile_firewall_hooks(cfg)
     return backend
 
 def firewall_add(ip, seconds, cfg):
     backend = ensure_firewall(cfg)
     if backend == "ipset":
-        run(["ipset", "add", IPSET_NAME, ip, "timeout", str(max(60, int(seconds))), "-exist"])
+        run_required(["ipset", "add", IPSET_NAME, ip, "timeout", str(max(60, int(seconds))), "-exist"])
     else:
-        check = run(["iptables", "-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP"])
-        if check.returncode != 0:
-            run(["iptables", "-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP"])
+        rule = [IPTABLES_CHAIN, "-s", ip, "-j", "DROP"]
+        if run(["iptables", "-C"] + rule).returncode != 0:
+            run_required(["iptables", "-A"] + rule)
+        if run(["iptables", "-C"] + rule).returncode != 0:
+            raise RuntimeError(f"failed to verify firewall block for {ip}")
 
 def firewall_del(ip, cfg):
     backend = firewall_backend(cfg)
     if backend == "ipset":
-        run(["ipset", "del", IPSET_NAME, ip])
+        result = run(["ipset", "del", IPSET_NAME, ip])
+        if result.returncode not in {0, 1}:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise RuntimeError(f"failed to remove {ip} from {IPSET_NAME}: {detail}")
     else:
-        while run(["iptables", "-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP"]).returncode == 0:
-            run(["iptables", "-D", IPTABLES_CHAIN, "-s", ip, "-j", "DROP"])
+        delete_all_rules([IPTABLES_CHAIN, "-s", ip, "-j", "DROP"])
 
 def expire_blocks(state, cfg, apply=True):
     now = now_utc()
     kept = []
-    expired = []
+    removed = []
     for row in state.get("blacklisted", []):
+        ip = row.get("ip", "")
         try:
             exp = parse_iso(row["expires_at"])
         except Exception:
-            expired.append(row)
+            removed.append((row, "invalid expiry"))
             continue
         if exp <= now:
-            expired.append(row)
+            removed.append((row, "expired"))
+        elif is_whitelisted(ip, state, cfg):
+            removed.append((row, "whitelisted or protected endpoint"))
         else:
             kept.append(row)
     state["blacklisted"] = kept
     if apply:
-        for row in expired:
-            firewall_del(row["ip"], cfg)
+        for row, _reason in removed:
+            if row.get("ip"):
+                firewall_del(row["ip"], cfg)
         ensure_firewall(cfg)
         for row in kept:
             seconds = max(60, int((parse_iso(row["expires_at"]) - now).total_seconds()))
             firewall_add(row["ip"], seconds, cfg)
-    return expired
+    return [row for row, _reason in removed]
+
+def build_cron_text(use_flock=None, scan_schedule="* * * * *"):
+    # Locking is implemented inside SNF so cron and manual invocations share
+    # exactly one lock owner. Keep use_flock for caller/API compatibility.
+    return (
+        "SHELL=/bin/sh\n"
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+        f"{scan_schedule} root /usr/local/bin/snf scan >> /var/log/smart_nginx_firewall.log 2>&1\n"
+        "@reboot root /usr/local/bin/snf expire >> /var/log/smart_nginx_firewall.log 2>&1\n"
+    )
 
 def cmd_install():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -392,12 +603,21 @@ def cmd_install():
             INSTALL_LINK.unlink()
     if not INSTALL_LINK.exists():
         INSTALL_LINK.symlink_to(INSTALL_TARGET)
-    cron = (
-        "SHELL=/bin/sh\n"
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
-        "50 23 * * * root /usr/local/bin/snf scan >> /var/log/smart_nginx_firewall.log 2>&1\n"
-        "@reboot root /usr/local/bin/snf expire >> /var/log/smart_nginx_firewall.log 2>&1\n"
-    )
+
+    # Preserve existing scan schedule if cron file exists
+    scan_schedule = "* * * * *"
+    if CRON_FILE.exists():
+        try:
+            for line in CRON_FILE.read_text(encoding="utf-8").splitlines():
+                if "snf scan" in line and not line.startswith("#"):
+                    parts = line.split("root")
+                    if parts:
+                        scan_schedule = parts[0].strip()
+                        break
+        except Exception:
+            pass
+
+    cron = build_cron_text(use_flock=have("flock"), scan_schedule=scan_schedule)
     CRON_FILE.write_text(cron, encoding="utf-8")
     os.chmod(CRON_FILE, 0o644)
     cfg = load_config()
@@ -434,6 +654,7 @@ def cmd_dry_run():
         f"scan_hours={cfg['scan_hours']} "
         f"threshold_score={cfg['threshold_score']} "
         f"threshold_bad_requests={cfg['threshold_bad_requests']} "
+        f"threshold_transmission_auth_failures={cfg['threshold_transmission_auth_failures']} "
         f"minimum_bad_signal_rate={cfg['minimum_bad_signal_rate']} "
         f"minimum_good_requests_for_rate_check={cfg['minimum_good_requests_for_rate_check']}"
     )
@@ -446,43 +667,81 @@ def cmd_dry_run():
     for score, ip, st in rows[: int(cfg["max_candidates_to_apply"])]:
         print(f"{ip}\t{st.reason()}")
 
+class ProcessLock:
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = open(self.lock_path, "a+")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.fd.close()
+            self.fd = None
+            return False
+        return True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd:
+            import fcntl
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+            self.fd = None
+
 def cmd_scan():
-    cfg = load_config()
-    state = load_state()
-    expired = expire_blocks(state, cfg, apply=True)
-    rows = candidate_rows(cfg, state)
-    max_apply = int(cfg["max_candidates_to_apply"])
-    now = now_utc()
-    expires = now + timedelta(days=int(cfg["block_days"]))
-    existing = block_lookup(state)
-    applied = 0
-    for score, ip, st in rows[:max_apply]:
-        if ip in existing or is_whitelisted(ip, state, cfg):
-            continue
-        reason = st.reason()
-        seconds = int((expires - now).total_seconds())
-        firewall_add(ip, seconds, cfg)
-        row = {
-            "ip": ip,
-            "blocked_at": iso(now),
-            "expires_at": iso(expires),
-            "reason": reason,
-            "score": score
-        }
-        state["blacklisted"].append(row)
-        applied += 1
-        print(f"blocked {ip}: {reason}")
-    save_json(STATE_FILE, state)
-    print(f"expired={len(expired)} blocked={applied}")
+    with ProcessLock(LOCK_FILE) as acquired:
+        if not acquired:
+            print("another SNF operation is already running; scan skipped", file=sys.stderr)
+            return
+        cfg = load_config()
+        state = load_state()
+        expired = expire_blocks(state, cfg, apply=True)
+        rows = candidate_rows(cfg, state)
+        max_apply = int(cfg["max_candidates_to_apply"])
+        now = now_utc()
+        expires = now + timedelta(days=int(cfg["block_days"]))
+        existing = block_lookup(state)
+        applied = 0
+        for score, ip, st in rows[:max_apply]:
+            if ip in existing or is_whitelisted(ip, state, cfg):
+                continue
+            reason = st.reason()
+            seconds = int((expires - now).total_seconds())
+            firewall_add(ip, seconds, cfg)
+            row = {
+                "ip": ip,
+                "blocked_at": iso(now),
+                "expires_at": iso(expires),
+                "reason": reason,
+                "score": score
+            }
+            state["blacklisted"].append(row)
+            # Persist after every successful kernel mutation. If a later
+            # candidate fails, previously installed blocks remain owned by
+            # state and can still be expired or manually removed.
+            save_json(STATE_FILE, state)
+            applied += 1
+            print(f"blocked {ip}: {reason}")
+        # Also persist expiration/whitelist reconciliation when no new block
+        # was added in this scan.
+        save_json(STATE_FILE, state)
+        print(f"expired={len(expired)} blocked={applied}")
 
 def cmd_expire():
-    cfg = load_config()
-    state = load_state()
-    expired = expire_blocks(state, cfg, apply=True)
-    save_json(STATE_FILE, state)
-    for row in expired:
-        print(f"expired {row.get('ip')} blocked_at={row.get('blocked_at')} reason={row.get('reason')}")
-    print(f"expired={len(expired)} active={len(state.get('blacklisted', []))}")
+    with ProcessLock(LOCK_FILE) as acquired:
+        if not acquired:
+            print("another SNF operation is already running; expire skipped", file=sys.stderr)
+            return
+        cfg = load_config()
+        state = load_state()
+        expired = expire_blocks(state, cfg, apply=True)
+        save_json(STATE_FILE, state)
+        for row in expired:
+            print(f"expired {row.get('ip')} blocked_at={row.get('blocked_at')} reason={row.get('reason')}")
+        print(f"expired={len(expired)} active={len(state.get('blacklisted', []))}")
 
 def cmd_list_blocked():
     state = load_state()
@@ -544,16 +803,25 @@ def cmd_whitelist(args):
 def cmd_status():
     cfg = load_config()
     state = load_state()
+    backend = firewall_backend(cfg)
+    hook_args = get_firewall_hook_spec(backend)
+    hook_str = " ".join(hook_args)
+    ovpn_eps = get_openvpn_endpoints(cfg)
     print(f"config_dir={CONFIG_DIR}")
     print(f"state_file={STATE_FILE} exists={STATE_FILE.exists()}")
     print(f"config_file={CONFIG_FILE} exists={CONFIG_FILE.exists()}")
     print(f"cron_file={CRON_FILE} exists={CRON_FILE.exists()}")
-    print(f"firewall_backend={firewall_backend(cfg)}")
+    print(f"flock_available={have('flock')}")
+    print(f"firewall_backend={backend}")
+    print(f"firewall_hook=INPUT 1 {hook_str}")
+    print(f"openvpn_endpoints_protected={len(ovpn_eps)} ({','.join(ovpn_eps[:5])}{'...' if len(ovpn_eps) > 5 else ''})")
     print(f"blocked={len(state.get('blacklisted', []))} whitelisted={len(state.get('whitelisted', []))}")
     print(
         f"scan_hours={cfg['scan_hours']} "
         f"block_days={cfg['block_days']} "
         f"threshold_score={cfg['threshold_score']} "
+        f"threshold_bad_requests={cfg['threshold_bad_requests']} "
+        f"threshold_transmission_auth_failures={cfg['threshold_transmission_auth_failures']} "
         f"minimum_bad_signal_rate={cfg['minimum_bad_signal_rate']} "
         f"minimum_good_requests_for_rate_check={cfg['minimum_good_requests_for_rate_check']}"
     )
@@ -562,7 +830,7 @@ def cmd_help():
     print("""smart_nginx_firewall / snf
 
 Commands:
-  snf install                         Install script, config, cron, and firewall hook
+  snf install                         Install script, config, cron, and port-scoped firewall hook
   snf dry-run                         Analyze nginx logs and show block candidates only
   snf scan                            Expire old blocks, analyze logs, and block candidates
   snf expire                          Remove expired blocks and reconcile active firewall entries
