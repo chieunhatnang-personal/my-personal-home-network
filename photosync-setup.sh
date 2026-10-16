@@ -1163,7 +1163,7 @@ REMOTE_SCRIPT
 restic_controller_command() (
   local id=$1 action=$2 dir repository_url password_command sftp_command credential_id=$1 lock_fd lock_path
   shift 2
-  if [[ $action == restore || $action == ls || $action == repository-snapshots ]] && [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
+  if [[ $action == cleanup-preview || $action == cleanup-apply || $action == restore || $action == ls || $action == repository-snapshots ]] && [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
     hp_resolve_repository "$id"
   elif [[ -f $RESTIC_JOBS_DIR/$id/job.conf ]]; then
     hp_resolve_job "$id"
@@ -1171,9 +1171,10 @@ restic_controller_command() (
   elif [[ -f $RESTIC_REPOSITORIES_DIR/$id/repository.conf ]]; then
     hp_resolve_repository "$id"
   else
+    EXCLUSIONS_EXPLICIT=no; unset EXCLUDE_PATHS
     load_controller_server "$id"
   fi
-  if [[ $action == backup || $action == maintenance || $action == restore ]]; then
+  if [[ $action == cleanup-preview || $action == cleanup-apply || $action == backup || $action == maintenance || $action == restore ]]; then
     hp_restic_init
     lock_path="$RESTIC_LOCKS_DIR/repository-${credential_id}.lock"
     exec {lock_fd}>"$lock_path"
@@ -1196,14 +1197,16 @@ restic_controller_command() (
       ;;
     backup)
       hp_restic_source_guard
-      local compression_args=()
+      local compression_args=() exclusion_args=() excluded
+      hp_effective_exclusions
+      for excluded in "${EXCLUDE_PATHS[@]}"; do exclusion_args+=(--exclude "$excluded"); done
       if restic backup --help | grep -q -- --compression; then compression_args=(--compression "$COMPRESSION"); fi
       # Interrupted network sessions leave repository locks behind. Restic's
       # normal unlock removes only stale locks and preserves active ones.
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
         unlock
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
-        backup --one-file-system "${compression_args[@]}" --tag "photosync-$SERVER_ID" "${SOURCE_PATHS[@]}" "$@"
+        backup --one-file-system --exclude-caches "${exclusion_args[@]}" "${compression_args[@]}" --tag "photosync-$SERVER_ID" "${SOURCE_PATHS[@]}" "$@"
       ;;
     dry-run)
       # A controller dry run validates authentication and repository access.
@@ -1211,6 +1214,10 @@ restic_controller_command() (
       # Restic would still walk and read every configured source file.
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" \
         cat config >/dev/null
+      ;;
+    cleanup-preview|cleanup-apply)
+      local HP_CLEANUP_COMMAND=(restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command")
+      hp_cleanup_locked "$action" "$id" "$@"
       ;;
     repository-snapshots)
       restic -r "$repository_url" --password-command "$password_command" -o "sftp.command=$sftp_command" snapshots "$@"
@@ -2807,10 +2814,10 @@ write_controller_repository_config() {
 }
 write_controller_job_config() {
   local dir path; hp_restic_init; dir=$(hp_resource_dir job "$JOB_ID"); mkdir -p "$dir"
-  { printf 'JOB_ID=%q\nJOB_LABEL=%q\nJOB_REPOSITORY_ID=%q\nBACKUP_TIME=%q\nMAINTENANCE_TIME=%q\nKEEP_DAILY=%q\nKEEP_WEEKLY=%q\nKEEP_MONTHLY=%q\nKEEP_YEARLY=%q\nCOMPRESSION=%q\nENABLED=%q\nSOURCE_PATHS=(' "$JOB_ID" "$JOB_LABEL" "$JOB_REPOSITORY_ID" "$BACKUP_TIME" "$MAINTENANCE_TIME" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_MONTHLY" "$KEEP_YEARLY" "$COMPRESSION" "$ENABLED"; for path in "${SOURCE_PATHS[@]}"; do printf ' %q' "$path"; done; printf ' )\n'; } > "$dir/job.conf"
+  { printf 'JOB_ID=%q\nJOB_LABEL=%q\nJOB_REPOSITORY_ID=%q\nBACKUP_TIME=%q\nMAINTENANCE_TIME=%q\nKEEP_DAILY=%q\nKEEP_WEEKLY=%q\nKEEP_MONTHLY=%q\nKEEP_YEARLY=%q\nCOMPRESSION=%q\nENABLED=%q\nSOURCE_PATHS=(' "$JOB_ID" "$JOB_LABEL" "$JOB_REPOSITORY_ID" "$BACKUP_TIME" "$MAINTENANCE_TIME" "$KEEP_DAILY" "$KEEP_WEEKLY" "$KEEP_MONTHLY" "$KEEP_YEARLY" "$COMPRESSION" "$ENABLED"; for path in "${SOURCE_PATHS[@]}"; do printf ' %q' "$path"; done; printf ' )\n'; if [[ ${EXCLUSIONS_EXPLICIT:-no} == yes ]]; then printf 'EXCLUDE_PATHS=('; for path in "${EXCLUDE_PATHS[@]}"; do printf ' %q' "$path"; done; printf ' )\n'; fi; } > "$dir/job.conf"
   chmod 0600 "$dir/job.conf"
 }
-load_controller_job() { SOURCE_PATHS=(); local d; d=$(hp_resource_dir job "$1"); [[ -f $d/job.conf ]] || die "Restic job not configured: $1"; . "$d/job.conf"; }
+load_controller_job() { SOURCE_PATHS=(); unset EXCLUDE_PATHS; EXCLUSIONS_EXPLICIT=no; local d; d=$(hp_resource_dir job "$1"); [[ -f $d/job.conf ]] || die "Restic job not configured: $1"; . "$d/job.conf"; if declare -p EXCLUDE_PATHS >/dev/null 2>&1; then EXCLUSIONS_EXPLICIT=yes; fi; hp_effective_exclusions; }
 load_controller_repository() { local d; d=$(hp_resource_dir repository "$1"); [[ -f $d/repository.conf ]] || die "Restic repository not configured: $1"; . "$d/repository.conf"; }
 load_controller_storage() { local d; d=$(hp_resource_dir storage "$1"); [[ -f $d/storage.conf ]] || die "Restic storage not configured: $1"; . "$d/storage.conf"; }
 
@@ -3009,8 +3016,8 @@ hp_prompt_job_fields() {
   choose_menu 'Compression' 'Automatic' 'Maximum' 'Off'; case $MENU_INDEX in 0) COMPRESSION=auto;; 1) COMPRESSION=max;; *) COMPRESSION=off;; esac
   choose_menu 'Schedule' 'Enable' 'Disable'; ((MENU_INDEX == 0)) && ENABLED=yes || ENABLED=no
 }
-hp_add_job() { select_repository || return; JOB_REPOSITORY_ID=$HP_SELECTED_RESOURCE; ask_name 'Job id' nightly; JOB_ID=$REPLY; [[ ! -e $RESTIC_JOBS_DIR/$JOB_ID ]] || die 'Job id already exists.'; SOURCE_PATHS=(); hp_prompt_job_fields; write_controller_job_config; write_controller_jobs "$JOB_ID"; }
-hp_edit_job() { local id=$1; load_controller_job "$id"; hp_prompt_job_fields; write_controller_job_config; write_controller_jobs "$id"; }
+hp_add_job() { select_repository || return; JOB_REPOSITORY_ID=$HP_SELECTED_RESOURCE; ask_name 'Job id' nightly; JOB_ID=$REPLY; [[ ! -e $RESTIC_JOBS_DIR/$JOB_ID ]] || die 'Job id already exists.'; SOURCE_PATHS=(); EXCLUDE_PATHS=(); EXCLUSIONS_EXPLICIT=yes; hp_prompt_job_fields; write_controller_job_config; write_controller_jobs "$JOB_ID"; }
+hp_edit_job() { local id=$1; load_controller_job "$id"; hp_prompt_job_fields; hp_exclusions_stale_warning; write_controller_job_config; write_controller_jobs "$id"; }
 
 dry_run_controller_server() {
   local id=$1 path unit
@@ -3498,33 +3505,301 @@ hp_restic_jobs_menu() {
   while :; do
     running=$(hp_running_job_ids)
     if [[ -n $running ]]; then
-      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Run backup now' 'Run backup now in background' 'View background backup task' 'Stop running backup task' 'View snapshots' 'Delete job' 'Back'
+      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Manage excluded directories' 'Run backup now' 'Run backup now in background' 'View background backup task' 'Stop running backup task' 'View snapshots' 'Delete job' 'Back'
       case $MENU_INDEX in
         0) hp_action hp_add_job;;
         1) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_edit_job "$id"; };;
-        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
-        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
-        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
-        5) hp_select_running_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_stop_job_background "$id"; };;
-        6) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
-        7) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
+        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_exclusions_menu "$id"; };;
+        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
+        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
+        5) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
+        6) hp_select_running_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_stop_job_background "$id"; };;
+        7) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
+        8) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
         *) return;;
       esac
     else
-      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Run backup now' 'Run backup now in background' 'View background backup task' 'View snapshots' 'Delete job' 'Back'
+      choose_menu 'Restic · Backup jobs and settings' 'Add job' 'Edit sources/schedule/maintenance/retention/compression/enabled' 'Manage excluded directories' 'Run backup now' 'Run backup now in background' 'View background backup task' 'View snapshots' 'Delete job' 'Back'
       case $MENU_INDEX in
         0) hp_action hp_add_job;;
         1) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_edit_job "$id"; };;
-        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
-        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
-        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
-        5) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
-        6) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
+        2) select_job && { id=$HP_SELECTED_RESOURCE; hp_exclusions_menu "$id"; };;
+        3) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" backup; };;
+        4) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_run_job_background "$id"; };;
+        5) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_view_job_background "$id"; };;
+        6) select_job && { id=$HP_SELECTED_RESOURCE; hp_action restic_controller_command "$id" snapshots; };;
+        7) select_job && { id=$HP_SELECTED_RESOURCE; hp_action hp_delete_job "$id"; };;
         *) return;;
       esac
     fi
   done
 }
+
+# Jobs without the optional array retain the deployment's pre-existing behavior.
+# Never reset this array in server/storage/repository loaders.
+hp_effective_exclusions() {
+  if [[ ${EXCLUSIONS_EXPLICIT:-no} != yes ]]; then
+    EXCLUDE_PATHS=('/mnt/photos/immich/encoded-video')
+  fi
+}
+hp_exclusion_valid() {
+  local candidate=$1 source canonical
+  hp_restore_valid_path "$candidate" || return 1
+  canonical=$(realpath -m -- "$candidate") || return 1
+  [[ $candidate == "$canonical" ]] || return 1
+  for source in "${SOURCE_PATHS[@]}"; do
+    source=$(realpath -m -- "$source") || return 1
+    [[ $source != / && $candidate == "$source/"* ]] && return 0
+  done
+  return 1
+}
+hp_exclusions_stale_warning() {
+  local path
+  for path in "${EXCLUDE_PATHS[@]}"; do
+    hp_exclusion_valid "$path" || printf 'WARNING: exclusion no longer beneath a current source (preserved): %s\n' "$path"
+  done
+}
+hp_exclusions_show() {
+  printf 'Job %s · repository %s\nExcluded directories (cache-tagged directories also excluded):\n' "$JOB_ID" "$JOB_REPOSITORY_ID"
+  if ((${#EXCLUDE_PATHS[@]})); then printf '  %s\n' "${EXCLUDE_PATHS[@]}"; else printf '  (none)\n'; fi
+  [[ ${EXCLUSIONS_EXPLICIT:-no} == yes ]] || printf 'Legacy compatibility defaults; first add/remove saves an explicit per-job array.\n'
+  hp_exclusions_stale_warning
+}
+hp_exclusion_add() {
+  local id=$1 candidate existing
+  load_controller_job "$id"
+  ask 'Literal absolute excluded directory (spaces supported)'; candidate=$REPLY
+  hp_exclusion_valid "$candidate" || die 'Use a canonical non-root literal descendant of a current source; no globs, control characters or symlink aliases.'
+  for existing in "${EXCLUDE_PATHS[@]}"; do
+    [[ $candidate != "$existing" && $candidate != "$existing/"* && $existing != "$candidate/"* ]] || die 'Duplicate or overlapping parent/child exclusion; remove the overlapping entry first.'
+  done
+  [[ ! -e $candidate || -d $candidate ]] || die 'Excluded path is not a directory.'
+  if [[ ! -d $candidate ]]; then
+    printf 'WARNING: directory does not exist now: %s\n' "$candidate"
+    confirm 'Save this missing directory exclusion for future backups?' || return
+  fi
+  confirm "Exclude '$candidate' and its contents from future backups of job '$JOB_ID'? Existing snapshots are unchanged." || return 0
+  EXCLUDE_PATHS+=("$candidate"); EXCLUSIONS_EXPLICIT=yes; write_controller_job_config
+  note 'Exclusion saved for the next backup run; any current run is unchanged.'
+}
+hp_exclusion_remove() {
+  local id=$1 index kept=() path
+  load_controller_job "$id"
+  ((${#EXCLUDE_PATHS[@]})) || { note 'No excluded directories.'; return; }
+  choose_menu 'Remove exclusion from future backups only' "${EXCLUDE_PATHS[@]}" 'Cancel'
+  ((MENU_INDEX < ${#EXCLUDE_PATHS[@]})) || return
+  index=$MENU_INDEX
+  confirm "Remove exclusion '${EXCLUDE_PATHS[$index]}'? Future backups may include it; local files and existing snapshots are unchanged." || return 0
+  for path in "${!EXCLUDE_PATHS[@]}"; do [[ $path == "$index" ]] || kept+=("${EXCLUDE_PATHS[$path]}"); done
+  EXCLUDE_PATHS=("${kept[@]}"); EXCLUSIONS_EXPLICIT=yes; write_controller_job_config
+}
+hp_exclusions_menu() {
+  local id=$1
+  while :; do
+    choose_menu 'Manage excluded directories' 'View exclusions' 'Add excluded directory' 'Remove excluded directory' 'Remove excluded paths from existing backups' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_exclusions_view "$id";;
+      1) hp_action hp_exclusion_add "$id";;
+      2) hp_action hp_exclusion_remove "$id";;
+      3) hp_cleanup_menu "$id";;
+      *) return;;
+    esac
+  done
+}
+hp_exclusions_view() { load_controller_job "$1"; hp_exclusions_show; }
+hp_cleanup_menu() {
+  local id=$1
+  while :; do
+    choose_menu 'Remove excluded paths from existing backups' 'Preview cleanup (no changes)' 'Apply cleanup and reclaim space' 'Back'
+    case $MENU_INDEX in
+      0) hp_action hp_cleanup_action "$id" cleanup-preview;;
+      1) hp_action hp_cleanup_action "$id" cleanup-apply;;
+      *) return;;
+    esac
+  done
+}
+hp_cleanup_action() {
+  local id=$1 action=$2 repository
+  hp_resolve_job "$id"; repository=$JOB_REPOSITORY_ID
+  hp_restore_stop_backups || return
+  # Explicit repository action prevents job/repository ID collisions.
+  restic_controller_command "$repository" "$action" "$id"
+}
+
+# All selection, real dry runs, verification and mutation run under the same
+# repository flock. Restic's own locks are never bypassed or force-unlocked.
+hp_cleanup_locked() {
+  local action=$1 repository=$2 job=$3 path snapshot replacement answer record before after paths_json source_json initial inventory scope
+  local chosen_paths=() choices=() ids=() labels=() selected_ids=() affected_ids=() rewrite_args=() originals=() replacements=()
+  command_exists jq || die 'Historical cleanup requires jq; install it explicitly first.'
+  restic rewrite --help > /dev/null 2>&1 || die 'Installed Restic has no rewrite command; upgrade explicitly, never automatically.'
+  local help_text
+  help_text=$(restic rewrite --help) || return 1
+  [[ $help_text == *--dry-run* && $help_text == *--exclude* ]] || die 'Installed Restic rewrite lacks required dry-run/exclude features.'
+  load_controller_job "$job"
+  [[ $JOB_REPOSITORY_ID == "$repository" ]] || die 'Job repository changed; restart cleanup.'
+  hp_exclusions_show
+  choices=("${EXCLUDE_PATHS[@]}")
+  ((${#choices[@]})) || { note 'No exclusions selected: nothing to clean.'; return; }
+  while ((${#choices[@]})); do
+    choose_menu 'Choose excluded paths to remove from history (repeat; Done finishes)' "${choices[@]}" 'Done' 'Cancel'
+    ((MENU_INDEX <= ${#choices[@]})) || return
+    ((MENU_INDEX < ${#choices[@]})) || break
+    path=${choices[$MENU_INDEX]}
+    hp_exclusion_valid "$path" || die "Stale/unsafe exclusion: $path. Fix job sources/exclusions before cleanup."
+    chosen_paths+=("$path"); unset 'choices[MENU_INDEX]'; choices=("${choices[@]}")
+  done
+  ((${#chosen_paths[@]})) || { note 'No selected paths; no changes.'; return; }
+  paths_json=$(printf '%s\n' "${chosen_paths[@]}" | jq -Rsc 'split("\n")[:-1]')
+  source_json=$(printf '%s\n' "${SOURCE_PATHS[@]}" | jq -Rsc 'split("\n")[:-1]')
+  for path in "${chosen_paths[@]}"; do rewrite_args+=(--exclude "$path"); done
+  initial=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || die 'Cannot inventory snapshots.'
+  hp_cleanup_inventory_valid "$initial" || die 'Invalid snapshot inventory.'
+  choose_menu 'Historical scope (tags do not prove job ownership)' 'Select individual snapshots' "All snapshots tagged photosync-$SERVER_ID" 'All repository snapshots (including other jobs/hosts)' 'Cancel'
+  scope=$MENU_INDEX
+  case $scope in
+    0)
+      mapfile -t ids < <(jq -r 'sort_by(.time) | reverse | .[].id' <<< "$initial")
+      mapfile -t labels < <(jq -r 'sort_by(.time) | reverse | .[] | [.id,.time,.hostname,.paths,.tags] | @json' <<< "$initial")
+      while ((${#ids[@]})); do
+        choose_menu 'Select immutable snapshot IDs (repeat; Done finishes)' "${labels[@]}" 'Done' 'Cancel'
+        ((MENU_INDEX <= ${#ids[@]})) || return
+        ((MENU_INDEX < ${#ids[@]})) || break
+        selected_ids+=("${ids[$MENU_INDEX]}")
+        unset 'ids[MENU_INDEX]' 'labels[MENU_INDEX]'; ids=("${ids[@]}"); labels=("${labels[@]}")
+      done;;
+    1) printf 'WARNING: server tag is not job ownership; review paths/hosts carefully.\n'
+       mapfile -t selected_ids < <(jq -r --arg tag "photosync-$SERVER_ID" '.[] | select((.tags // []) | index($tag)) | .id' <<< "$initial");;
+    2) confirm 'WARNING: include ALL snapshots, even unrelated jobs and hosts?' || return
+       mapfile -t selected_ids < <(jq -r '.[].id' <<< "$initial");;
+    *) return;;
+  esac
+  ((${#selected_ids[@]})) || { note 'No snapshot matches/selection; no changes.'; return; }
+  # Local durable journal survives every failure/interruption; never auto-resume.
+  record=$(mktemp -d "$RESTIC_REPOSITORIES_DIR/$repository/cleanup-XXXXXXXX") || return 1
+  chmod 0700 "$record"
+  printf '%s\n' "$initial" > "$record/inventory.json"
+  printf '%s\n' "$paths_json" > "$record/paths.json"
+  printf '%s\n' "${selected_ids[@]}" > "$record/selected-ids"
+  printf 'preflight\n' > "$record/stage"
+  trap 'printf "Cleanup stopped. Review journal: %s; originals are not automatically forgotten. Never blindly resume.\n" "$record" >&2' ERR
+  printf 'Recovery journal: %s\nFrozen full snapshot IDs:\n' "$record"; printf '  %s\n' "${selected_ids[@]}"
+  printf 'Selected literal paths:\n'; printf '  %s\n' "${chosen_paths[@]}"
+  local external_locks
+  external_locks=$("${HP_CLEANUP_COMMAND[@]}" list locks) || die 'Cannot inspect external Restic locks.'
+  [[ -z $external_locks ]] || die 'External Restic lock(s) present; wait or investigate. Cleanup never unlocks them.'
+  "${HP_CLEANUP_COMMAND[@]}" check || die "Repository check failed; no cleanup. Journal: $record"
+  for snapshot in "${selected_ids[@]}"; do
+    "${HP_CLEANUP_COMMAND[@]}" ls --json "$snapshot" > "$record/$snapshot.before.jsonl" || die 'Cannot inspect original tree.'
+    before=$record/$snapshot.before.jsonl
+    hp_cleanup_tree_valid "$before" || die 'Invalid original file tree.'
+    # No matching entries means no rewrite, avoiding accidental summary-only rewrites.
+    if ! jq -es --argjson paths "$paths_json" 'any(.[]; select(.struct_type == "node") | .path as $p | any($paths[]; . as $e | $p == $e or ($p | startswith($e + "/"))))' "$before" >/dev/null; then
+      printf '%s: no selected excluded entries; skipped.\n' "$snapshot"; continue
+    fi
+    # rewrite can DELETE empty snapshots even WITHOUT --forget. A surviving
+    # actual source file/symlink, not ancestor directories, is mandatory.
+    hp_cleanup_has_survivor "$before" "$paths_json" "$source_json" || die "Refusing possibly empty resulting snapshot $snapshot; originals must survive rewrite."
+    affected_ids+=("$snapshot")
+    "${HP_CLEANUP_COMMAND[@]}" rewrite --dry-run "${rewrite_args[@]}" "$snapshot" || die "Real rewrite dry-run failed: $snapshot"
+  done
+  ((${#affected_ids[@]})) || { note "No matching entries. No changes. Journal: $record"; return; }
+  printf '%s\n' "${affected_ids[@]}" > "$record/affected-ids"
+  printf 'preview-complete\n' > "$record/stage"
+  [[ $action == cleanup-apply ]] || { note 'Preview complete: repository unchanged. Apply repeats selection and real dry-run under lock.'; return; }
+  printf 'IRREVERSIBLE: rewrite history, forget verified originals, then prune unreferenced data.\nLocal source files are untouched. Deduplication prevents promising exact space savings.\nType repository ID %s to apply: ' "$repository"
+  IFS= read -r answer || return
+  [[ $answer == "$repository" ]] || { note 'Confirmation mismatch; no changes.'; return; }
+  inventory=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || return 1
+  hp_cleanup_same_inventory "$initial" "$inventory" || die 'Repository changed during preview; restart cleanup.'
+  printf 'rewriting (originals retained until ALL replacements verified)\n' > "$record/stage"
+  for snapshot in "${affected_ids[@]}"; do
+    external_locks=$("${HP_CLEANUP_COMMAND[@]}" list locks) || die 'Cannot inspect external locks.'
+    [[ -z $external_locks ]] || die "External Restic locks block mutation. Journal: $record"
+    after=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || return 1
+    hp_cleanup_same_inventory "$inventory" "$after" || die "Inventory changed before rewrite; restart. Journal: $record"
+    "${HP_CLEANUP_COMMAND[@]}" rewrite "${rewrite_args[@]}" "$snapshot" || die "Rewrite failed; no originals forgotten. Journal: $record"
+    after=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || die 'Cannot inventory replacement; originals retained.'
+    hp_cleanup_inventory_valid "$after" || die 'Invalid replacement inventory.'
+    # Only one new ID, no disappearances; .original must be the exact full input ID.
+    replacement=$(jq -er --argjson old "$inventory" --arg original "$snapshot" '
+      ($old | map(.id)) as $oldids | (map(.id)) as $newids |
+      if all($oldids[]; . as $id | $newids | index($id)) then
+        [.[] | select(.id as $id | $oldids | index($id) | not)] |
+        if length == 1 and .[0].original == $original then .[0].id else error("ambiguous replacement") end
+      else error("original inventory changed") end' <<< "$after") || die "Ambiguous rewrite; do not forget anything. Journal: $record"
+    jq -e --arg old "$snapshot" --arg new "$replacement" '
+      (map(select(.id == $old))[0]) as $a |
+      (map(select(.id == $new))[0]) as $b |
+      ($a != null and $b != null) and
+      (($a | del(.id,.short_id,.tree,.original,.tags,.summary)) == ($b | del(.id,.short_id,.tree,.original,.tags,.summary))) and
+      ((($a.tags // []) + ["rewrite"] | unique | sort) == (($b.tags // []) | unique | sort))
+    ' <<< "$after" >/dev/null || die "Replacement snapshot metadata changed unexpectedly; originals retained. Journal: $record"
+    "${HP_CLEANUP_COMMAND[@]}" ls --json "$replacement" > "$record/$snapshot.after.jsonl" || die 'Cannot inspect replacement.'
+    hp_cleanup_verify_tree "$record/$snapshot.before.jsonl" "$record/$snapshot.after.jsonl" "$paths_json" || die "Replacement tree mismatch; originals retained. Journal: $record"
+    "${HP_CLEANUP_COMMAND[@]}" diff --json --metadata "$snapshot" "$replacement" > "$record/$snapshot.diff.jsonl" || die 'Cannot verify content/metadata differences; originals retained.'
+    hp_cleanup_verify_diff "$record/$snapshot.diff.jsonl" "$paths_json" || die 'Unexpected content/metadata change; originals retained.'
+    printf '%s -> %s\n' "$snapshot" "$replacement" | tee -a "$record/mappings"
+    originals+=("$snapshot"); replacements+=("$replacement"); inventory=$after
+  done
+  printf 'all-replacements-verified\n' > "$record/stage"
+  after=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || return 1
+  hp_cleanup_same_inventory "$inventory" "$after" || die 'Concurrent inventory change; originals retained, no prune.'
+  "${HP_CLEANUP_COMMAND[@]}" check || die 'Check failed before forget; originals retained.'
+  printf 'forgetting-explicit-originals (inspect inventory if interrupted)\n' > "$record/stage"
+  "${HP_CLEANUP_COMMAND[@]}" forget "${originals[@]}" || die "Forget failed/partial; no prune. Journal: $record"
+  after=$("${HP_CLEANUP_COMMAND[@]}" snapshots --json) || return 1
+  local expected
+  expected=$(jq --argjson removed "$(printf '%s\n' "${originals[@]}" | jq -Rsc 'split("\n")[:-1]')" 'map(select(.id as $id | $removed | index($id) | not))' <<< "$inventory")
+  hp_cleanup_same_inventory "$expected" "$after" || die 'Unexpected post-forget inventory; no prune.'
+  printf 'pruning (forget complete)\n' > "$record/stage"
+  "${HP_CLEANUP_COMMAND[@]}" prune || die "Prune failed/partial. Originals already forgotten. Journal: $record"
+  printf 'checking-after-prune\n' > "$record/stage"
+  "${HP_CLEANUP_COMMAND[@]}" check || die "Post-cleanup check failed. Journal: $record"
+  printf 'complete\n' > "$record/stage"
+  note "Cleanup complete. Mappings: $record/mappings. Space reclaimed depends on shared references; retention settings unchanged."
+}
+hp_cleanup_has_survivor() {
+  jq -es --argjson paths "$2" --argjson sources "$3" '
+    def excluded($p): any($paths[]; . as $e | $p == $e or ($p | startswith($e + "/")));
+    any(.[]; .struct_type == "node" and (.type == "file" or .type == "symlink") and
+      (.path as $p | (excluded($p) | not) and any($sources[]; . as $s | $p | startswith($s + "/"))))' "$1" >/dev/null
+}
+hp_cleanup_inventory_valid() {
+  jq -e 'type == "array" and all(.[]; (.id | type == "string" and test("^[0-9a-f]{64}$"))) and ((map(.id) | unique | length) == length)' <<< "$1" >/dev/null
+}
+hp_cleanup_same_inventory() {
+  hp_cleanup_inventory_valid "$2" || return 1
+  [[ $(jq -Sc 'sort_by(.id)' <<< "$1") == "$(jq -Sc 'sort_by(.id)' <<< "$2")" ]]
+}
+hp_cleanup_tree_valid() {
+  jq -es 'any(.[]; .struct_type == "snapshot") and all(.[]; .struct_type == "snapshot" or (.struct_type == "node" and (.path | type == "string" and startswith("/")) and (.type | type == "string")))' "$1" >/dev/null
+}
+hp_cleanup_verify_tree() {
+  local original=$1 rewritten=$2 paths=$3 expected actual
+  hp_cleanup_tree_valid "$rewritten" || return 1
+  # ls exposes node metadata, but not file content hashes. diff below verifies
+  # those hashes. Parent subtree hashes necessarily change; no other metadata may.
+  expected=$(jq -Scs --argjson paths "$paths" '
+    def excluded($p): any($paths[]; . as $e | $p == $e or ($p | startswith($e + "/")));
+    [.[] | select(.struct_type == "node") | select(excluded(.path) | not) | del(.subtree)] | sort_by(.path)' "$original") || return 1
+  actual=$(jq -Scs --argjson paths "$paths" '
+    def excluded($p): any($paths[]; . as $e | $p == $e or ($p | startswith($e + "/")));
+    if any(.[]; .struct_type == "node" and excluded(.path)) then error("excluded entry survives") else
+    [.[] | select(.struct_type == "node") | del(.subtree)] | sort_by(.path) end' "$rewritten") || return 1
+  [[ $expected == "$actual" ]]
+}
+hp_cleanup_verify_diff() {
+  jq -es --argjson paths "$2" '
+    def excluded($p): any($paths[]; . as $e | $p == $e or ($p | startswith($e + "/")));
+    any(.[]; .message_type == "statistics") and
+    all(.[]; if .message_type == "change" then
+      (.path | rtrimstr("/")) as $p |
+      (.modifier == "-" and excluded($p)) or
+      (.modifier == "U" and (.path | endswith("/")) and any($paths[]; startswith($p + "/")))
+    else .message_type == "statistics" and .changed_files == 0 end)' "$1" >/dev/null
+}
+
 # Restore is repository-scoped: no job is needed to recover an old snapshot.
 hp_restore_valid_path() {
   local path=$1

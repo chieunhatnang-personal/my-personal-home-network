@@ -2,6 +2,8 @@ dh.pem
 
 # Local operator handoff contains private machine/account information.
 /HomePhotoProject_ForAgents.md
+# Local project memory includes private deployment details; never publish it.
+/.hermes.md
 # Never publish local HomePhotos state or downloaded private credentials.
 /homephotos-local/
 __pycache__/
